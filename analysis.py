@@ -131,6 +131,9 @@ class DeepAnalytics:
             else:
                 continue
 
+            # [Fix] 清洗 NaN 和 Inf
+            signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Remove DC component
             signal = signal - np.mean(signal)
 

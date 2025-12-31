@@ -6,7 +6,6 @@ from enum import Enum, auto
 from collections import deque
 from dataclasses import dataclass
 
-
 # --- 引入底层物理内核 ---
 from physics import RailVehicleMBDSystem
 
@@ -26,6 +25,7 @@ class VehicleState(Enum):
     BRAKING_NORMAL = auto()  # 进站制动
     BRAKING_EMERGENCY = auto()  # ATP 触发紧急制动
     FAULT_RECOVERY = auto()  # 故障降级模式
+    ARRIVED = auto()  # [Fix] 新增到达状态
 
 
 @dataclass
@@ -44,7 +44,6 @@ class SlidingModeController:
     [Control Algo] Robust Sliding Mode Controller (SMC).
     Designed to handle high uncertainty in mud friction.
     Control Law: u = u_eq + u_sw
-    u_sw = -K * sat(s/phi)
     """
 
     def __init__(self, mass, max_voltage, k_gain=15.0, lambda_s=0.5):
@@ -52,8 +51,11 @@ class SlidingModeController:
         self.max_voltage = max_voltage
         self.K = k_gain  # 鲁棒增益 (应对扰动上限)
         self.lam = lambda_s  # 滑模面收敛率
-        self.phi = 2.0  # 边界层厚度 (抑制抖振 Chattering)
-        self.integral_e = 0.0  # 误差积分
+        # [CRITICAL FIX] 极大增大边界层厚度，抑制抖振 (Chattering)
+        self.phi = 15.0
+        self.integral_e = 0.0
+        # [NEW] 用于输出滤波
+        self.prev_u = 0.0
 
     def compute(self, target_v, current_v, dt, estimated_resistance):
         """
@@ -62,12 +64,18 @@ class SlidingModeController:
         # 1. 定义误差与滑模面
         e = target_v - current_v
         self.integral_e += e * dt
+        # 抗积分饱和
+        self.integral_e = np.clip(self.integral_e, -10.0, 10.0)
+
         s = e + self.lam * self.integral_e
 
         # 2. 等效控制 (Equivalent Control)
-        u_eq = estimated_resistance * 0.05  # 粗略前馈
+        # 前馈补偿
+        u_eq = estimated_resistance * 0.2
 
         # 3. 切换控制 (Switching Control)
+        # [Fix] 使用饱和函数 (sat) 代替符号函数 (sign)
+        # s/phi 在 [-1, 1] 之间是线性的，超过则是饱和的
         sat_s = np.clip(s / self.phi, -1.0, 1.0)
         u_sw = self.K * sat_s
 
@@ -75,7 +83,13 @@ class SlidingModeController:
         u_total = u_eq + u_sw
         u_clamped = np.clip(u_total, -self.max_voltage, self.max_voltage)
 
-        return u_clamped, s
+        # [CRITICAL FIX] 输出低通滤波 (LPF)
+        # 模拟真实执行器的延迟，禁止电压瞬变
+        alpha = 0.1  # 新值权重
+        u_smooth = (1.0 - alpha) * self.prev_u + alpha * u_clamped
+        self.prev_u = u_smooth
+
+        return u_smooth, s
 
 
 class VehicleAgent:
@@ -129,10 +143,11 @@ class VehicleAgent:
         self.current_lock = None
 
         # --- 3. 控制与安全 ---
+        # [Adjust] 降低控制器增益，避免过激
         self.controller = SlidingModeController(
             mass=self.cfg['mass_full'],
             max_voltage=48.0,
-            k_gain=10.0
+            k_gain=8.0
         )
         self.energy = EnergyAudit()
 
@@ -152,7 +167,7 @@ class VehicleAgent:
         """
         # 1. 状态感知 (Perception)
         real_v = self.physics.state[1]
-        sensor_v = real_v + np.random.normal(0, 0.05)  # 速度传感器噪声
+        sensor_v = real_v + np.random.normal(0, 0.02)  # 降低观测噪声
 
         # 2. 边缘计算功耗
         self.energy.compute_joules += 2.0 * dt
@@ -182,33 +197,34 @@ class VehicleAgent:
                 self.state = VehicleState.BRAKING_NORMAL
             else:
                 dist_to_target = self._dist_to(self.path_queue[0])
-                braking_dist = (sensor_v ** 2) / (2 * self.safe_braking_decel * (1 - 0.5 * self.env['mud_factor']))
 
-                if dist_to_target < braking_dist + 2.0:
+                # [Fix] 更柔和的速度规划
+                target_v = self.cfg['max_speed']
+                if dist_to_target < 20.0: target_v = 3.0  # 提前减速
+
+                if dist_to_target < 2.0:
                     self.state = VehicleState.BRAKING_NORMAL
                 else:
-                    target_v = self.cfg['max_speed']
-                    est_resist = 50.0 + 10.0 * sensor_v + 0.5 * sensor_v ** 2
+                    est_resist = 200.0 + 50.0 * sensor_v
                     u_cmd, _ = self.controller.compute(target_v, sensor_v, dt, est_resist)
-                    # Arrived Check
-                    if dist_to_target < 2.0:
-                        self.path_queue.popleft()
 
         elif self.state == VehicleState.BRAKING_NORMAL:
             if not self.path_queue:
                 u_cmd = 0.0
                 self.state = VehicleState.IDLE
             else:
-                dist_to_target = self._dist_to(self.path_queue[0])
-                if dist_to_target < 0.5:
+                dist = self._dist_to(self.path_queue[0])
+                # [Fix] 判定到达逻辑
+                if dist < 0.5 and abs(sensor_v) < 0.2:
                     self.path_queue.popleft()
                     if not self.path_queue:
                         self.state = VehicleState.IDLE
                         u_cmd = 0.0
                     else:
-                        self.state = VehicleState.NEGOTIATING
+                        self.state = VehicleState.TRACTION_CONTROL
                 else:
-                    u_cmd = -24.0
+                    # 柔和制动
+                    u_cmd = -24.0 if sensor_v > 0 else 24.0
 
         # --- 3. 物理执行 (Actuation) ---
         dynamics = self.physics.step_rk4(dt, u_cmd)
@@ -221,14 +237,13 @@ class VehicleAgent:
         # 运动学更新
         v_mps = dynamics['loco_vel']
 
-        # [CRITICAL FIX] 移除了 > 0.01 的阈值判断。
-        # 只要有任何微小的速度，都进行里程累加和位置更新。
-        # 这解决了“电机在转但车看起来不动”的 Bug。
-        if abs(v_mps) > 0.0:
+        # [CRITICAL FIX] 修复位置更新漂移问题
+        # 使用积分后的实际位移，仅在速度大于死区时更新
+        if abs(v_mps) > 1e-4:
+            dist_step = v_mps * dt
             self.time_active += dt
-            dist_step = abs(v_mps * dt)
-            self.dist_accumulated += dist_step
-            self._update_kinematics(v_mps, dt)
+            self.dist_accumulated += abs(dist_step)
+            self._update_kinematics(dist_step)
 
         # 5. 打包全量遥测数据
         self.last_telemetry = {
@@ -241,14 +256,12 @@ class VehicleAgent:
             'rssi': -65.0,
             'energy_total': self.energy.total,
             'mud': self.env['mud_factor'],
-
-            # [NEW SCI METRICS]
-            'p_inst': p_inst,  # 瞬时功率 (W)
-            'mu': dynamics['mu_effective'],  # 微观摩擦系数
-            'mass': dynamics['mass_total'],  # 车辆质量
-            'length': dynamics['length'],  # 车辆长度
-            'dist_accum': self.dist_accumulated,  # 里程 (m)
-            'time_active': self.time_active  # 活跃时间 (s)
+            'p_inst': p_inst,
+            'mu': dynamics['mu_effective'],
+            'mass': dynamics['mass_total'],
+            'length': dynamics['length'],
+            'dist_accum': self.dist_accumulated,
+            'time_active': self.time_active
         }
         return self.last_telemetry
 
@@ -288,15 +301,24 @@ class VehicleAgent:
         target_pos = np.array(self.map.nodes[node_id].pos)
         return np.linalg.norm(self.pos_2d - target_pos)
 
-    def _update_kinematics(self, vel_1d, dt):
+    def _update_kinematics(self, dist_step):
+        """
+        [Fix] 严格沿着路径向量移动，解决漂移问题
+        """
         if not self.path_queue: return
         target_id = self.path_queue[0]
         if target_id not in self.map.nodes: return
+
         target_pos = np.array(self.map.nodes[target_id].pos)
         vec = target_pos - self.pos_2d
-        dist = np.linalg.norm(vec)
-        if dist > 0.1:
-            direction = vec / dist
-            self.pos_2d += direction * vel_1d * dt
 
+        dist_remain = np.linalg.norm(vec)
+        if dist_remain > 1e-4:
+            direction = vec / dist_remain
 
+            # 防止过冲 (Overshoot)
+            # 只有向前走(dist_step > 0)且步长大于剩余距离时才直接吸附
+            if dist_step > 0 and dist_step > dist_remain:
+                self.pos_2d = target_pos
+            else:
+                self.pos_2d += direction * dist_step

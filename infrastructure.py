@@ -109,34 +109,37 @@ class ZD6Mechanism:
         F_total = F_friction(Mud) + F_locking(Position) + F_external
         """
         # 1. 泥浆介质 Stribeck 摩擦
-        # 泥泞度越高，静摩擦(F_s)和粘滞阻力(sigma)越大
+        # [Fix] 使用 tanh 平滑，防止除零和数值震荡
         F_c = 300.0 + 500.0 * self.mud
-        F_s = 600.0 + 1000.0 * self.mud
-        v_s = 0.002  # Stribeck velocity
-        sigma = 1000.0 * (1.0 + 5.0 * self.mud ** 2)  # 极高的粘性阻力
+        sigma = 1000.0 * (1.0 + 2.0 * self.mud)
 
-        f_fric = (F_c + (F_s - F_c) * np.exp(-(abs(v_linear) / v_s) ** 2)) * np.sign(v_linear) \
-                 + sigma * v_linear
+        # 简化后的稳定摩擦模型
+        f_fric = F_c * math.tanh(10.0 * v_linear) + sigma * v_linear
 
         # 2. 机械锁闭阻力曲线 (Locking Curve)
-        # 在行程的两端 (0~10mm, 150~160mm) 有巨大的机械阻力用于解锁/闭锁
         f_lock = 0.0
         if self.pos < 0.01 or self.pos > (self.p.stroke - 0.01):
-            f_lock = self.p.locking_force_peak * (1.0 + 0.2 * np.random.randn())  # 随机卡滞
-            # 阻力方向总是阻碍运动
-            f_lock *= np.sign(v_linear) if abs(v_linear) > 1e-4 else 0.0
+            f_lock = self.p.locking_force_peak
+            if abs(v_linear) > 1e-4:
+                f_lock *= np.sign(v_linear)
+            else:
+                f_lock = 0.0
 
         return f_fric + f_lock
 
     def step(self, dt, motor_torque, external_force_N=0.0):
-        # 传动关系: Linear V = w / ratio * pitch / (2pi) ???
-        # ZD6 通常是减速齿轮 + 齿条 或 滚珠丝杠
-        # 简化转换系数 K_trans: Torque -> Force
-        # Force = Torque * Ratio * Efficiency / Radius_effective
-        # 假设 1 rad 电机 = k_linear m 位移
+        # 传动关系
         k_linear = self.p.screw_pitch / (2 * np.pi * self.p.gear_ratio)
 
         v_linear = self.omega * k_linear
+
+        # [CRITICAL FIX] 物理限位逻辑 (Hard Stops)
+        # 防止道岔到达终点后位置继续增加导致的数值溢出
+        if (self.pos <= 0 and motor_torque < 0) or \
+                (self.pos >= self.p.stroke and motor_torque > 0):
+            self.omega = 0.0
+            v_linear = 0.0
+            return self.pos, self.omega
 
         # 折算到电机轴的负载力矩
         force_total = self.get_mechanical_load(v_linear) + external_force_N
@@ -148,13 +151,8 @@ class ZD6Mechanism:
         self.omega += dw_dt * dt
         self.pos += (self.omega * k_linear) * dt
 
-        # Hard Stops
-        if self.pos <= 0:
-            self.pos = 0;
-            self.omega = 0
-        elif self.pos >= self.p.stroke:
-            self.pos = self.p.stroke;
-            self.omega = 0
+        # Pos Clamping
+        self.pos = np.clip(self.pos, 0.0, self.p.stroke)
 
         return self.pos, self.omega
 
