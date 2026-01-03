@@ -18,8 +18,8 @@ class SimVisualizer:
     """
 
     def __init__(self, grid_map, vehicles, config):
-        self.grid = grid_map;
-        self.vehicles = vehicles;
+        self.grid = grid_map
+        self.vehicles = vehicles
         self.cfg = config
 
         self.fig = plt.figure(figsize=(19, 12), facecolor='#f0f0f0')
@@ -39,25 +39,24 @@ class SimVisualizer:
 
         # 2. 纵向动力学 (双轴：力 & 摩擦)
         self.ax_phys = self.fig.add_subplot(gs[0, 2])
-        # [Fix 1] 使用 raw string 修复警告
         self.ax_phys.set_title(r"Coupler Force (L) vs Friction $\mu$ (R)")
         self.ax_mu = self.ax_phys.twinx()
 
         # 3. 三个子图
         self.ax_phase = self.fig.add_subplot(gs[1, 0])
         self.ax_phase.set_title("Stability: Phase Plane")
-        self.ax_phase.set_xlabel("e");
+        self.ax_phase.set_xlabel("e")
         self.ax_phase.set_ylabel("de/dt")
         self.ax_phase.grid(True)
 
         self.ax_sink = self.fig.add_subplot(gs[1, 1])
         self.ax_sink.set_title("Terramechanics: Sinkage")
-        self.ax_sink.set_ylim(0, 0.4);
+        self.ax_sink.set_ylim(0, 0.4)
         self.ax_sink.grid(True)
 
         self.ax_rssi = self.fig.add_subplot(gs[1, 2])
         self.ax_rssi.set_title("Comm: RSSI (dBm)")
-        self.ax_rssi.set_ylim(-130, -40);
+        self.ax_rssi.set_ylim(-130, -40)
         self.ax_rssi.grid(True)
 
         # 4. 遥测矩阵 (底部全宽)
@@ -91,21 +90,32 @@ class SimVisualizer:
                 ax.text(n.pos[0], n.pos[1], nid, fontsize=8)
 
     def _init_table(self):
-        # [SCI Columns Definition]
         self.cols = [
-            "ID", "Mass (kg)", "Len (m)",  # 静态
-            "μ_eff (1)", "Mud Fac",  # 环境交互
-            "v_inst (km/h)", "v_avg (km/h)",  # 速度
-            "P_inst (kW)", "P_avg (kW)",  # 功率
-            "E_tot (kJ)", "SEC (J/kg·m)"  # 能效
+            "ID", "Mass (kg)", "Len (m)",
+            "μ_eff (1)", "Mud Fac",
+            "v_inst (km/h)", "v_avg (km/h)",
+            "P_inst (kW)", "P_avg (kW)",
+            "E_tot (kJ)", "SEC (J/kg·m)"
         ]
         cell_text = [["-" for _ in self.cols] for _ in self.vehicles]
         self.table = self.ax_table.table(
             cellText=cell_text, colLabels=self.cols, loc='center', cellLoc='center',
             bbox=[0.0, 0.0, 1.0, 0.9], colColours=["#e0e0e0"] * len(self.cols)
         )
-        self.table.auto_set_font_size(False);
+        self.table.auto_set_font_size(False)
         self.table.set_fontsize(9)
+
+    def _smooth_data(self, history, new_val, alpha=0.3):
+        """
+        [DSP Filter] 低通滤波 (Low Pass Filter)
+        解决方波和直角问题，使曲线平滑。
+        alpha: 平滑系数 (0.0 - 1.0)，越小越平滑，0.3 是平衡点。
+        """
+        if not history:
+            return new_val
+        last_val = history[-1]
+        # EMA 公式: y[t] = y[t-1]*(1-alpha) + x[t]*alpha
+        return last_val * (1.0 - alpha) + new_val * alpha
 
     def update(self, data):
         t, vehicles = data
@@ -123,47 +133,65 @@ class SimVisualizer:
         for v in vehicles:
             # --- 1. Map Render ---
             c = 'lime' if v.state.name == "TRACTION_CONTROL" else 'gold'
-            r = patches.Rectangle((v.pos_2d[0] - 10, v.pos_2d[1] - 5), 20, 10, fc=c, ec='k', zorder=5)
-            self.ax_map.add_patch(r);
+            # 保持大尺寸车辆绘制
+            r = patches.Rectangle((v.pos_2d[0] - 20, v.pos_2d[1] - 10), 40, 20, fc=c, ec='k', zorder=5)
+            self.ax_map.add_patch(r)
             self.dyn_objs.append(r)
-            txt = self.ax_map.text(v.pos_2d[0], v.pos_2d[1] + 12, v.id, ha='center', fontsize=7)
+            txt = self.ax_map.text(v.pos_2d[0], v.pos_2d[1] + 25, v.id, ha='center', fontsize=9, fontweight='bold')
             self.dyn_objs.append(txt)
 
-            # --- 2. Data Processing ---
+            # --- 2. Data Processing & Filtering ---
             tm = getattr(v, 'last_telemetry', {})
             st = self.d_store[v.id]
 
-            # Extract
-            mu = tm.get('mu', 0);
-            f = tm.get('force', 0) / 1000
-            vel = tm.get('vel', 0);
+            # 提取原始数据
+            raw_mu = tm.get('mu', 0)
+            raw_force = tm.get('force', 0) / 1000
+            raw_vel = tm.get('loco_vel', tm.get('vel', 0))
+
+            # [DSP 核心] 应用平滑滤波
+            smooth_f = self._smooth_data(st['force'], raw_force, alpha=0.3)
+            smooth_mu = self._smooth_data(st['mu'], raw_mu, alpha=0.3)
+
+            # RSSI 也可以平滑一下
+            raw_rssi = tm.get('rssi', -90)
+            smooth_rssi = self._smooth_data(st['rssi'], raw_rssi, alpha=0.2)
+
+            # 更新历史缓存 (存入平滑后的值)
+            st['force'].append(smooth_f)
+            st['mu'].append(smooth_mu)
+
+            # 其他数据处理
             p_inst = tm.get('p_inst', 0)
-            e_tot = tm.get('energy_total', 0);
+            e_tot = tm.get('energy_total', 0)
             dist = tm.get('dist_accum', 0)
             t_act = tm.get('time_active', 0.1)
             mud = tm.get('mud', 0.5)
-            mass = tm.get('mass', 0)
+            mass = tm.get('mass_total', tm.get('mass', 0))
 
-            # Update Hist
-            st['force'].append(f);
-            st['mu'].append(mu)
-            st['sink'].append(0.05 * mud / (abs(vel) + 0.5))
-            st['rssi'].append(tm.get('rssi', -90))
-            err = 15.0 - vel;
-            st['err'].append(err)
-            st['err_d'].append(err - (st['err'][-2] if len(st['err']) > 1 else err))
+            st['sink'].append(0.05 * mud / (abs(raw_vel) + 0.5))
+            st['rssi'].append(smooth_rssi)
 
-            # Calc SCI Metrics
-            v_kmh = vel * 3.6
+            # 误差也平滑一下，让相平面图更好看
+            err = 15.0 - raw_vel
+            smooth_err = self._smooth_data(st['err'], err, alpha=0.4)
+            st['err'].append(smooth_err)
+
+            # 误差导数 (微分会放大噪声，所以需要更强的平滑)
+            raw_err_d = smooth_err - (st['err'][-2] if len(st['err']) > 1 else smooth_err)
+            smooth_err_d = self._smooth_data(st['err_d'], raw_err_d, alpha=0.2)
+            st['err_d'].append(smooth_err_d)
+
+            # SCI Metrics
+            v_kmh = raw_vel * 3.6
             v_avg = (dist / t_act * 3.6) if t_act > 1 else 0.0
             p_kw = p_inst / 1000.0
             p_avg = (e_tot / t_act / 1000.0) if t_act > 1 else 0.0
             sec = (e_tot / (mass * dist)) if dist > 10 else 0.0
 
-            # [SCI High Precision] 提高显示精度到 4 位小数，观察微动
             tab_vals.append([
                 str(v.id), f"{mass:.0f}", f"{tm.get('length', 0):.1f}",
-                f"{mu:.3f}", f"{mud:.2f}",
+                f"{raw_mu:.3f}", f"{mud:.2f}",
                 f"{v_kmh:.4f}", f"{v_avg:.2f}",
                 f"{p_kw:.1f}", f"{p_avg:.1f}",
                 f"{e_tot / 1000:.0f}", f"{sec:.4f}"
@@ -172,40 +200,41 @@ class SimVisualizer:
         # --- 3. Update Table ---
         for r, row in enumerate(tab_vals):
             for c, val in enumerate(row):
-                self.table[r + 1, c].get_text().set_text(val)
+                if r + 1 < len(self.table._cells) / len(self.cols):
+                    self.table[r + 1, c].get_text().set_text(val)
 
-        # --- 4. Update Plots (Only 1st vehicle to reduce clutter) ---
+        # --- 4. Update Plots ---
         if vehicles:
-            vid = vehicles[0].id;
+            vid = vehicles[0].id
             s = self.d_store[vid]
             if len(self.t_hist) == len(s['force']):
-                self.ax_phys.clear();
+                self.ax_phys.clear()
                 self.ax_mu.clear()
-                # [Fix 1] 使用 raw string 修复警告
-                self.ax_phys.set_title(r"Force (L) vs $\mu$ (R)");
+                self.ax_phys.set_title(r"Force (L) vs $\mu$ (R)")
                 self.ax_phys.grid(True, alpha=0.3)
-                self.ax_phys.plot(self.t_hist, s['force'], 'b-', alpha=0.6)
-                self.ax_mu.plot(self.t_hist, s['mu'], 'r--', alpha=0.6)
+                # 绘制平滑后的曲线
+                self.ax_phys.plot(self.t_hist, s['force'], 'b-', alpha=0.6, linewidth=1.5)
+                self.ax_mu.plot(self.t_hist, s['mu'], 'r--', alpha=0.6, linewidth=1.5)
 
-                self.ax_phase.clear();
-                self.ax_phase.set_title("Phase Plane");
+                self.ax_phase.clear()
+                self.ax_phase.set_title("Phase Plane (Filtered)")
                 self.ax_phase.grid(True)
-                self.ax_phase.plot(s['err'], s['err_d'], 'g-', alpha=0.5)
+                self.ax_phase.plot(s['err'], s['err_d'], 'g-', alpha=0.5, linewidth=1.2)
 
-                self.ax_sink.clear();
-                self.ax_sink.set_title("Sinkage");
+                self.ax_sink.clear()
+                self.ax_sink.set_title("Sinkage")
                 self.ax_sink.grid(True)
-                self.ax_sink.set_ylim(0, 0.4);
+                self.ax_sink.set_ylim(0, 0.4)
                 self.ax_sink.plot(self.t_hist, s['sink'], 'brown')
 
-                self.ax_rssi.clear();
-                self.ax_rssi.set_title("RSSI");
+                self.ax_rssi.clear()
+                self.ax_rssi.set_title("RSSI (Filtered)")
                 self.ax_rssi.grid(True)
-                self.ax_rssi.set_ylim(-130, -40);
+                self.ax_rssi.set_ylim(-130, -40)
                 self.ax_rssi.plot(self.t_hist, s['rssi'], 'purple')
 
     def start(self, gen):
-        # [Fix 2] 添加 cache_frame_data=False 修复内存警告
+        # cache_frame_data=False 修复警告
         ani = animation.FuncAnimation(
             self.fig, self.update, frames=gen,
             interval=20, blit=False, repeat=False,

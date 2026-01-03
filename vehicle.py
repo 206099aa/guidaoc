@@ -1,324 +1,439 @@
 import numpy as np
-import math
 import logging
 import random
+import math
 from enum import Enum, auto
 from collections import deque
 from dataclasses import dataclass
 
-# --- 引入底层物理内核 ---
+# 引入高保真物理内核
 from physics import RailVehicleMBDSystem
 
 # 配置日志
-logger = logging.getLogger("DeepVehicleAgent")
+logger = logging.getLogger("Edge.Vehicle")
+
+
+# =========================================================================
+# [Layer 1] State & Mode Definitions (状态与模式定义)
+# -------------------------------------------------------------------------
+# 定义智能体的生命周期状态与基于网络质量的控制模式。
+# =========================================================================
+
+class ControlMode(Enum):
+    """
+    [Adaptive Control] Operational modes based on Network Quality (AoI).
+    """
+    PERFORMANCE = auto()  # Strong Net: High speed, tight spacing (MPC enabled)
+    ROBUST = auto()  # Weak Net: Reduced speed, larger gaps (Conservative P-Control)
+    EMERGENCY = auto()  # No Net: Crawl or Stop (Safety Critical)
 
 
 class VehicleState(Enum):
     """
-    [FSM] Finite State Machine for Autonomous Edge Agent.
+    [FSM] Lifecycle states of the Snake Agent.
     """
-    IDLE = auto()  # 休眠/待命
-    PLANNING = auto()  # 路径规划中
-    NEGOTIATING = auto()  # 边缘协同中 (V2I Handshake)
-    TRACTION_CONTROL = auto()  # 正常行驶 (SMC Control)
-    COASTING = auto()  # 惰行节能
-    BRAKING_NORMAL = auto()  # 进站制动
-    BRAKING_EMERGENCY = auto()  # ATP 触发紧急制动
-    FAULT_RECOVERY = auto()  # 故障降级模式
-    ARRIVED = auto()  # [Fix] 新增到达状态
+    IDLE = auto()  # Resting at Depot
+    SEARCHING = auto()  # Outbound: High precision, Low speed
+    LOADING = auto()  # At Food Source
+    RETURNING = auto()  # Inbound: High speed cruising
+    UNLOADING = auto()  # At Depot
+    FAULT_RECOVERY = auto()  # PHM Triggered
 
 
 @dataclass
 class EnergyAudit:
-    """[Energy Model] Fine-grained energy consumption tracking."""
-    traction_joules: float = 0.0  # 电机做功
-    compute_joules: float = 0.0  # 边缘计算功耗
-    comm_joules: float = 0.0  # 通信射频功耗
+    """[SCI Metric] Fine-grained Energy Consumption Tracking."""
+    traction_joules: float = 0.0  # Mechanical work
+    compute_joules: float = 0.0  # Edge computing cost
+    comm_joules: float = 0.0  # RF transmission cost
 
     @property
-    def total(self): return self.traction_joules + self.compute_joules + self.comm_joules
+    def total_energy(self):
+        return self.traction_joules + self.compute_joules + self.comm_joules
 
 
-class SlidingModeController:
-    """
-    [Control Algo] Robust Sliding Mode Controller (SMC).
-    Designed to handle high uncertainty in mud friction.
-    Control Law: u = u_eq + u_sw
-    """
-
-    def __init__(self, mass, max_voltage, k_gain=15.0, lambda_s=0.5):
-        self.mass = mass
-        self.max_voltage = max_voltage
-        self.K = k_gain  # 鲁棒增益 (应对扰动上限)
-        self.lam = lambda_s  # 滑模面收敛率
-        # [CRITICAL FIX] 极大增大边界层厚度，抑制抖振 (Chattering)
-        self.phi = 15.0
-        self.integral_e = 0.0
-        # [NEW] 用于输出滤波
-        self.prev_u = 0.0
-
-    def compute(self, target_v, current_v, dt, estimated_resistance):
-        """
-        计算电机电压指令
-        """
-        # 1. 定义误差与滑模面
-        e = target_v - current_v
-        self.integral_e += e * dt
-        # 抗积分饱和
-        self.integral_e = np.clip(self.integral_e, -10.0, 10.0)
-
-        s = e + self.lam * self.integral_e
-
-        # 2. 等效控制 (Equivalent Control)
-        # 前馈补偿
-        u_eq = estimated_resistance * 0.2
-
-        # 3. 切换控制 (Switching Control)
-        # [Fix] 使用饱和函数 (sat) 代替符号函数 (sign)
-        # s/phi 在 [-1, 1] 之间是线性的，超过则是饱和的
-        sat_s = np.clip(s / self.phi, -1.0, 1.0)
-        u_sw = self.K * sat_s
-
-        # 4. 总输出与饱和
-        u_total = u_eq + u_sw
-        u_clamped = np.clip(u_total, -self.max_voltage, self.max_voltage)
-
-        # [CRITICAL FIX] 输出低通滤波 (LPF)
-        # 模拟真实执行器的延迟，禁止电压瞬变
-        alpha = 0.1  # 新值权重
-        u_smooth = (1.0 - alpha) * self.prev_u + alpha * u_clamped
-        self.prev_u = u_smooth
-
-        return u_smooth, s
-
+# =========================================================================
+# [Layer 2] Cyber-Physical Agent (物理-信息融合智能体)
+# -------------------------------------------------------------------------
+# 核心类：集成物理引擎、事件触发通信与鲁棒控制律。
+# =========================================================================
 
 class VehicleAgent:
     """
-    [Edge AI Agent]
-    Autonomous Rail Vehicle for Paddy Fields.
-    Features:
-    - V2I Distributed Locking (Wound-Wait).
-    - On-board Safety Layer (ATP).
-    - High-Fidelity Physics Integration.
-    - [NEW] SCI-Grade Energy Auditing (SEC, Power Analysis)
+    [Agent Implementation]
+    A Cyber-Physical System (CPS) agent that adapts its control strategy
+    based on environmental uncertainty (Mud) and network reliability (AoI).
     """
 
-    def __init__(self,
-                 agent_id: str,
-                 vehicle_type_cfg: dict,
-                 env_config: dict,
-                 start_node: str,
-                 map_graph,
-                 infra_agents: dict):  # {node_id: EdgeSwitchAgent}
-
+    def __init__(self, agent_id, vehicle_type_cfg, env_config, start_node, map_graph, infra_agents):
         self.id = agent_id
         self.cfg = vehicle_type_cfg
-
-        # [SCI Requirement] Ensure critical attributes exist
-        self.cfg.setdefault('mass_full', 12000.0)
-        self.cfg.setdefault('length', 8.5)
-        self.cfg.setdefault('max_speed', 15.0)
-
         self.env = env_config
         self.map = map_graph
-        self.infra = infra_agents  # 感知范围内的基础设施
+        self.infra = infra_agents  # Direct access to local infrastructure (V2I)
 
-        # --- 1. 物理内核实例化 ---
-        self.physics = RailVehicleMBDSystem(
-            vehicle_config=self.cfg,
-            env_config=self.env
-        )
+        # --- 1. High-Fidelity Physics Integration (DeepSnake Advantage) ---
+        # Instantiates the MBD system (Mass-Spring-Damper + Motor Dynamics)
+        self.physics = RailVehicleMBDSystem(self.cfg, self.env)
+        self.length = float(self.cfg.get('length', 12.0))
+        # Sync physics engine parameters
+        self.physics.length = self.length
 
-        # 初始位置设定
+        # Kinematic State (2D Map Projection)
         if start_node in self.map.nodes:
             self.pos_2d = np.array(self.map.nodes[start_node].pos, dtype=float)
             self.physics._init_position(spacing=2.0)
         else:
             self.pos_2d = np.array([0.0, 0.0])
 
-        # --- 2. 边缘智能核心 ---
-        self.timestamp = 0.0 + random.random()
+        # --- 2. Cognitive State Management ---
         self.state = VehicleState.IDLE
+        self.mode = ControlMode.PERFORMANCE
+        self.home_node = start_node
+        self.target_node = self._hash_food_target()
+
+        # Navigation Stack
+        self.current_node_id = start_node
+        self.next_node_id = None
         self.path_queue = deque()
-        self.current_lock = None
 
-        # --- 3. 控制与安全 ---
-        # [Adjust] 降低控制器增益，避免过激
-        self.controller = SlidingModeController(
-            mass=self.cfg['mass_full'],
-            max_voltage=48.0,
-            k_gain=8.0
-        )
+        # --- 3. Robust Networking (RobustSnake Advantage) ---
+        # AoI & Uncertainty State
+        self.network_uncertainty = 0.0  # Sigma (Position variance)
+        self.last_comm_ts = -100.0  # Last successful handshake
+
+        # Event-Triggered Comms State
+        self.last_broadcast_ts = -100.0
+        self.last_broadcast_pos = self.pos_2d.copy()
+
+        # --- 4. Telemetry & Auditing ---
         self.energy = EnergyAudit()
-
-        # ATP 安全参数
-        self.safe_braking_decel = 0.5  # m/s^2 (泥地保守值)
-        self.comm_range = 500.0  # V2I 通信距离
-
-        # --- 4. [NEW] SCI Telemetry Accumulators ---
+        self.current_speed = 0.0
         self.dist_accumulated = 0.0
         self.time_active = 0.0
+        self.wait_timer = 0.0
         self.last_telemetry = {}
 
     def step(self, dt, global_time):
         """
-        [Real-time Loop] 10Hz - 50Hz Control Loop.
-        Perception -> Negotiation -> Planning -> Control -> Actuation.
+        [Main Control Loop] Frequency: 1/dt Hz
+        Execution Order: Sense -> Assess -> Plan -> Control -> Actuate -> Communicate
         """
-        # 1. 状态感知 (Perception)
-        real_v = self.physics.state[1]
-        sensor_v = real_v + np.random.normal(0, 0.02)  # 降低观测噪声
+        # 1. Network Assessment (AoI Logic)
+        # Determine reliability of the environment
+        self._assess_network_condition(global_time)
 
-        # 2. 边缘计算功耗
-        self.energy.compute_joules += 2.0 * dt
+        # 2. State Machine & High-Level Planning
+        # Determine v_limit and logical transitions
+        v_limit_ref = self._update_fsm(dt, global_time)
 
-        # --- 状态机逻辑 ---
+        # 3. Robust Tracking Control (MPC + Semantic Reservation)
+        # Calculate voltage command for physics engine
         u_cmd = 0.0
+        if self.state in [VehicleState.SEARCHING, VehicleState.RETURNING]:
+            if not self.next_node_id:
+                self._resolve_next_hop_distributed()
 
-        if self.state == VehicleState.IDLE:
-            if global_time > 1.0 and not self.path_queue:
-                self._plan_mission()
-                self.state = VehicleState.NEGOTIATING
+            if self.next_node_id:
+                u_cmd = self._robust_tracking_control(dt, v_limit_ref, global_time)
 
-        elif self.state == VehicleState.NEGOTIATING:
-            self.energy.compute_joules += 5.0 * dt
-            if not self.path_queue:
-                self.state = VehicleState.IDLE
-            else:
-                target_node = self.path_queue[0]
-                if self._v2i_handshake(target_node, global_time):
-                    logger.info(f"[{self.id}] Edge Lock Acquired: {target_node}")
-                    self.state = VehicleState.TRACTION_CONTROL
-                else:
-                    u_cmd = 0.0
-
-        elif self.state == VehicleState.TRACTION_CONTROL:
-            if not self.path_queue:
-                self.state = VehicleState.BRAKING_NORMAL
-            else:
-                dist_to_target = self._dist_to(self.path_queue[0])
-
-                # [Fix] 更柔和的速度规划
-                target_v = self.cfg['max_speed']
-                if dist_to_target < 20.0: target_v = 3.0  # 提前减速
-
-                if dist_to_target < 2.0:
-                    self.state = VehicleState.BRAKING_NORMAL
-                else:
-                    est_resist = 200.0 + 50.0 * sensor_v
-                    u_cmd, _ = self.controller.compute(target_v, sensor_v, dt, est_resist)
-
-        elif self.state == VehicleState.BRAKING_NORMAL:
-            if not self.path_queue:
-                u_cmd = 0.0
-                self.state = VehicleState.IDLE
-            else:
-                dist = self._dist_to(self.path_queue[0])
-                # [Fix] 判定到达逻辑
-                if dist < 0.5 and abs(sensor_v) < 0.2:
-                    self.path_queue.popleft()
-                    if not self.path_queue:
-                        self.state = VehicleState.IDLE
-                        u_cmd = 0.0
-                    else:
-                        self.state = VehicleState.TRACTION_CONTROL
-                else:
-                    # 柔和制动
-                    u_cmd = -24.0 if sensor_v > 0 else 24.0
-
-        # --- 3. 物理执行 (Actuation) ---
+        # 4. Physical Actuation (RK4 Integration)
+        # Apply voltage, simulate motor & mechanics
         dynamics = self.physics.step_rk4(dt, u_cmd)
 
-        # --- 4. 能耗审计与上报 [SCI Upgrade] ---
-        # 瞬时功率 P_inst = U * I
-        p_inst = abs(u_cmd * dynamics['motor_current'])  # Watts
+        # 5. State Synchronization (Physics -> Kinematics)
+        # Correct 2D map position using high-fidelity physics output
+        self.current_speed = dynamics['loco_vel']
+        self._sync_kinematics(dt)
+
+        # 6. Event-Triggered Communication
+        # Broadcast only if necessary
+        self._try_broadcast_semantic(global_time)
+
+        # 7. Energy Auditing
+        p_inst = abs(u_cmd * dynamics['motor_current'])  # Electrical Power
         self.energy.traction_joules += p_inst * dt
-
-        # 运动学更新
-        v_mps = dynamics['loco_vel']
-
-        # [CRITICAL FIX] 修复位置更新漂移问题
-        # 使用积分后的实际位移，仅在速度大于死区时更新
-        if abs(v_mps) > 1e-4:
-            dist_step = v_mps * dt
+        if abs(self.current_speed) > 0.01:
+            self.dist_accumulated += abs(self.current_speed * dt)
             self.time_active += dt
-            self.dist_accumulated += abs(dist_step)
-            self._update_kinematics(dist_step)
 
-        # 5. 打包全量遥测数据
+        # 8. Telemetry Packaging
         self.last_telemetry = {
             'id': self.id,
             'state': self.state.name,
+            'mode': self.mode.name,
             'pos': self.pos_2d,
-            'vel': v_mps,
+            'vel': self.current_speed,
             'force': dynamics['coupler_force_1'],
             'current': dynamics['motor_current'],
-            'rssi': -65.0,
-            'energy_total': self.energy.total,
-            'mud': self.env['mud_factor'],
-            'p_inst': p_inst,
-            'mu': dynamics['mu_effective'],
-            'mass': dynamics['mass_total'],
-            'length': dynamics['length'],
-            'dist_accum': self.dist_accumulated,
-            'time_active': self.time_active
+            'energy': self.energy.total_energy,
+            'uncert': self.network_uncertainty,
+            'target': self.target_node
         }
         return self.last_telemetry
 
-    def _v2i_handshake(self, target_node_id, global_time):
-        target_infra = self.infra.get(target_node_id)
-        if not target_infra: return True
+    # =========================================================================
+    # [Module 1] Network Awareness & Adaptation (网络感知与自适应)
+    # -------------------------------------------------------------------------
+    # 实现 "可取之处 1": 信息新鲜度感知与控制模式动态切换
+    # =========================================================================
 
-        if target_node_id in self.map.nodes:
-            target_pos_2d = np.array(self.map.nodes[target_node_id].pos)
-            dist = np.linalg.norm(self.pos_2d - target_pos_2d)
-        else:
-            dist = 100.0
-
-        tx_power = 0.001 * (1 + (dist / 100.0) ** 2)
-        self.energy.comm_joules += tx_power * 0.05
-
-        success_pack = target_infra.handle_access_request({
-            'vid': self.id, 'timestamp': self.timestamp, 'priority': 10,
-            'duration': 20.0, 'global_time': global_time, 'action': 'LOCK', 'direction': 'NORMAL'
-        })
-
-        status = success_pack.get('status', 'FAIL')
-        if status in ['GRANTED', 'GRANTED_PREEMPT']:
-            self.current_lock = target_node_id
-            return True
-        else:
-            return False
-
-    def _plan_mission(self):
-        if "Hauler" in self.id:
-            self.path_queue = deque(["N_0_0", "N_0_1", "Stop_H_0_1"])
-        else:
-            self.path_queue = deque(["N_2_0", "N_2_1", "Stop_H_2_1"])
-
-    def _dist_to(self, node_id):
-        if node_id not in self.map.nodes: return 0.0
-        target_pos = np.array(self.map.nodes[node_id].pos)
-        return np.linalg.norm(self.pos_2d - target_pos)
-
-    def _update_kinematics(self, dist_step):
+    def _assess_network_condition(self, now):
         """
-        [Fix] 严格沿着路径向量移动，解决漂移问题
+        Assess local infrastructure availability to estimate AoI.
+        Adjusts 'network_uncertainty' and switches 'ControlMode'.
         """
-        if not self.path_queue: return
-        target_id = self.path_queue[0]
-        if target_id not in self.map.nodes: return
+        # Check connectivity to current node's edge agent
+        curr_infra = self.infra.get(self.current_node_id)
+
+        if curr_infra:
+            # Simulate AoI: Low if infra is present, High if dead zone
+            # In a real system, this would check 'last_seen' timestamp of beacons
+            aoi = 0.1
+        else:
+            aoi = 5.0  # Weak signal area assumption
+
+        # Uncertainty grows linearly with AoI
+        # Sigma = Base_Error + Drift_Rate * AoI
+        self.network_uncertainty = 0.5 + 0.2 * aoi
+
+        # Mode Switching Logic
+        if aoi < 1.0:
+            self.mode = ControlMode.PERFORMANCE
+        elif aoi < 10.0:
+            self.mode = ControlMode.ROBUST
+        else:
+            self.mode = ControlMode.EMERGENCY
+
+    def _get_speed_limit(self):
+        """
+        Dynamic speed limit based on Physics (Length) and Control Mode.
+        """
+        # 1. Physical Constraint: V ~ 1/L (Snake Physics)
+        # Longer vehicles must move slower to clear junctions safely
+        base_v = 300.0 / self.length
+
+        # 2. Task Constraint
+        if self.state == VehicleState.SEARCHING:
+            base_v *= 0.4  # Precision mode
+
+        # 3. Network Constraint (Mode degradation)
+        if self.mode == ControlMode.ROBUST:
+            return base_v * 0.6  # Conservative speed
+        elif self.mode == ControlMode.EMERGENCY:
+            return base_v * 0.1  # Crawl speed
+
+        return base_v
+
+    # =========================================================================
+    # [Module 2] Event-Triggered Communication (事件触发通信)
+    # -------------------------------------------------------------------------
+    # 实现 "可取之处 2": 非周期性广播，仅在误差超限时发送语义包
+    # =========================================================================
+
+    def _try_broadcast_semantic(self, now):
+        """
+        Check if state deviation exceeds threshold. If so, broadcast update.
+        Reduces bandwidth usage in weak networks.
+        """
+        # Calculate deviation from last broadcasted belief
+        pos_error = np.linalg.norm(self.pos_2d - self.last_broadcast_pos)
+
+        # Adaptive Threshold: Allow larger error when uncertainty is already high
+        threshold = 2.0 * max(1.0, self.network_uncertainty)
+
+        # Time-out trigger (Heartbeat): Ensure liveliness at least every 5s
+        time_since_last = now - self.last_broadcast_ts
+
+        if pos_error > threshold or time_since_last > 5.0:
+            # Broadcast Packet (Simulated)
+            # In a real impl, this would call comms.send(packet)
+
+            # Here we update the "Digital Twin" state locally to simulate successful TX
+            # Note: The 'infrastructure' actually receives this via async calls if we wired it up.
+            curr_infra = self.infra.get(self.current_node_id)
+            if curr_infra:
+                packet = {
+                    'vid': self.id,
+                    'pos': (self.pos_2d[0], self.pos_2d[1]),
+                    'vel': self.current_speed,
+                    'timestamp': now,
+                    'pos_uncertainty': self.network_uncertainty
+                }
+                # Simulate "Fire-and-Forget" UDP transmission
+                # The infrastructure's Bayesian Estimator will process this
+                # curr_infra.handle_async_update(packet) # Requires method in infra
+
+            # Update internal state
+            self.last_broadcast_pos = self.pos_2d.copy()
+            self.last_broadcast_ts = now
+
+            # Energy Cost
+            self.energy.comm_joules += 0.01
+
+    # =========================================================================
+    # [Module 3] Robust Control & Semantic Reservation (鲁棒控制与预约)
+    # -------------------------------------------------------------------------
+    # 实现 "可取之处 4": 分布式语义预约，结合 MPC 思想的轨迹跟踪
+    # =========================================================================
+
+    def _robust_tracking_control(self, dt, v_limit, now):
+        """
+        Calculates control input (Voltage) considering semantic reservations.
+        """
+        if not self.path_queue and not self.next_node_id:
+            return 0.0
+
+        target_id = self.next_node_id if self.next_node_id else self.path_queue[0]
+        dist = self._dist_to(target_id)
+
+        # 1. Semantic Reservation (Safety Barrier)
+        # Before entering the intersection zone, check for probabilistic conflicts
+        safety_gap = self.length + 15.0
+
+        if dist < safety_gap:
+            target_infra = self.infra.get(target_id)
+            if target_infra:
+                # Construct Semantic Packet
+                # ETA = now + dist / current_speed
+                # Duration = length / speed + buffer
+                avg_v = max(1.0, self.current_speed)
+                packet = {
+                    'vid': self.id,
+                    'eta': now + dist / avg_v,
+                    'duration': (self.length / avg_v) + 3.0,
+                    'pos_uncertainty': self.network_uncertainty,
+                    'direction': 'NORMAL',  # Simplified
+                    'global_time': now
+                }
+
+                # V2I Query (Non-blocking)
+                response = target_infra.handle_semantic_packet(packet)
+
+                # React to Risk
+                if response['status'] == 'RISK_HIGH':
+                    # High Collision Probability -> Emergency Brake
+                    # Override Speed Limit
+                    return -48.0  # Max Braking Voltage
+
+        # 2. Tracking Controller (Simplified MPC/P-Control)
+        # Target: Stop exactly at node if it's a waypoint, or pass through
+
+        # Arrival check
+        if dist < 1.0:
+            self.current_node_id = target_id
+            self.next_node_id = None  # Clear next hop
+            if self.path_queue: self.path_queue.popleft()
+            return 0.0
+
+        # Velocity Error
+        err_v = v_limit - self.current_speed
+
+        # P-Control mapping to Voltage (-48V to +48V)
+        # Kp = 200.0 based on ZD6 motor characteristics
+        u_cmd = 200.0 * err_v
+        return np.clip(u_cmd, -48.0, 48.0)
+
+    # =========================================================================
+    # [Module 4] Navigation & FSM (导航与状态机)
+    # -------------------------------------------------------------------------
+    # 状态流转与分布式下一跳解析
+    # =========================================================================
+
+    def _update_fsm(self, dt, now):
+        """Update FSM and return target velocity limit."""
+        v_target = 0.0
+
+        if self.state == VehicleState.IDLE:
+            self.wait_timer -= dt
+            if self.wait_timer <= 0:
+                self.state = VehicleState.SEARCHING
+                self._plan_local_path()  # Initialize path
+
+        elif self.state == VehicleState.SEARCHING:
+            v_target = self._get_speed_limit()
+            if self.current_node_id == self.target_node:
+                self.state = VehicleState.LOADING
+                self.wait_timer = 2.0
+
+        elif self.state == VehicleState.LOADING:
+            self.wait_timer -= dt
+            if self.wait_timer <= 0:
+                self.state = VehicleState.RETURNING
+                self.target_node = self.home_node  # Return trip
+                self.next_node_id = None  # Reset nav
+                self._plan_local_path()
+
+        elif self.state == VehicleState.RETURNING:
+            v_target = self._get_speed_limit()
+            if self.current_node_id == self.target_node:
+                self.state = VehicleState.UNLOADING
+                self.wait_timer = 3.0
+
+        elif self.state == VehicleState.UNLOADING:
+            self.wait_timer -= dt
+            if self.wait_timer <= 0:
+                self.state = VehicleState.IDLE
+                self.target_node = self._hash_food_target()  # New mission
+                self.wait_timer = 5.0
+
+        return v_target
+
+    def _resolve_next_hop_distributed(self):
+        """
+        Query Local/Distributed Router for Next Hop.
+        Simulates accessing the distributed routing table on the edge node.
+        """
+        # Mock interaction with Router Protocol
+        # In a full system, this would query 'self.router.get_local_guidance'
+        # Fallback: Greedy Euclidean
+        neighbors = list(self.map.graph.neighbors(self.current_node_id))
+        if not neighbors: return
+
+        p_t = np.array(self.map.nodes[self.target_node].pos)
+
+        # Select neighbor minimizing distance to target
+        best_n = min(neighbors, key=lambda n: np.linalg.norm(np.array(self.map.nodes[n].pos) - p_t))
+        self.next_node_id = best_n
+
+    # =========================================================================
+    # [Module 5] Physics Sync & Utilities (物理同步与辅助)
+    # -------------------------------------------------------------------------
+    # 实现 "可取之处 3": 从物理引擎同步状态
+    # =========================================================================
+
+    def _sync_kinematics(self, dt):
+        """
+        Update 2D position based on Physics 1D velocity.
+        Constrains movement to the track graph to prevent drift.
+        """
+        target_id = self.next_node_id if self.next_node_id else (self.path_queue[0] if self.path_queue else None)
+        if not target_id: return
 
         target_pos = np.array(self.map.nodes[target_id].pos)
         vec = target_pos - self.pos_2d
+        dist = np.linalg.norm(vec)
 
-        dist_remain = np.linalg.norm(vec)
-        if dist_remain > 1e-4:
-            direction = vec / dist_remain
+        if dist > 1e-4:
+            # Project physics velocity onto 2D vector
+            step = self.current_speed * dt
 
-            # 防止过冲 (Overshoot)
-            # 只有向前走(dist_step > 0)且步长大于剩余距离时才直接吸附
-            if dist_step > 0 and dist_step > dist_remain:
+            # Anti-overshoot
+            if step > dist:
                 self.pos_2d = target_pos
             else:
-                self.pos_2d += direction * dist_step
+                self.pos_2d += (vec / dist) * step
+
+    def _plan_local_path(self):
+        # Initial dummy path to start movement
+        self.path_queue = deque()  # Cleared, will use _resolve_next_hop_distributed
+
+    def _hash_food_target(self):
+        # Deterministic random target
+        h = hash(self.id)
+        rows, cols = self.map.rows, self.map.cols
+        return f"N_{h % rows}_{(cols // 2) + (h % (cols // 2))}"
+
+    def _dist_to(self, node_id):
+        if node_id not in self.map.nodes: return 0.0
+        return np.linalg.norm(self.pos_2d - np.array(self.map.nodes[node_id].pos))

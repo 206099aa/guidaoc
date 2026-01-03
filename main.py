@@ -56,8 +56,6 @@ class DecentralizedSimulation:
             map_graph=self.map,
             infra_agents=self.infra_agents  # 传入字典索引，而非列表
         )
-        # 手动设置启动延时 (如果 VehicleAgent 移除了该参数，我们可以通过修改内部状态模拟)
-        # v1.start_delay = 0.0 # VehicleAgent 最新版使用内部逻辑触发
         self.vehicles.append(v1)
 
         # --- V2: Fast Scout (Inspection) ---
@@ -73,7 +71,6 @@ class DecentralizedSimulation:
         self.vehicles.append(v2)
 
         # [SCI Depth] 注入 V2V 引用 (如果 vehicle.py 中需要进行车辆间通信/防撞)
-        # 即使 __init__ 没传，也可以通过属性注入
         for v in self.vehicles:
             v.all_vehicles = self.vehicles
 
@@ -116,9 +113,22 @@ class DecentralizedSimulation:
         # 定义生成器供 Visualization 使用
         def sim_generator():
             t = 0.0
+            step_count = 0
+
+            # [视觉优化] 渲染倍速设置
+            # 每计算 20 次物理帧，才画 1 次图
+            # 这样视觉速度会变快 20 倍，看着车就跑得快了
+            RENDER_SKIP = 20
+
             while t < duration:
                 self.step(t, dt)
-                yield t, self.vehicles
+
+                step_count += 1
+
+                # 只有当计数器整除 RENDER_SKIP 时，才向可视化界面发送数据
+                if step_count % RENDER_SKIP == 0:
+                    yield t, self.vehicles
+
                 t += dt
 
                 # 进度心跳
