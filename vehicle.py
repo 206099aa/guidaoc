@@ -86,6 +86,13 @@ class VehicleAgent:
         else:
             self.pos_2d = np.array([0.0, 0.0])
 
+        # [新增功能 Start] 3D 状态与 PHM 指标初始化
+        self.pos_3d = np.array([self.pos_2d[0], self.pos_2d[1], 0.0])  # x, y, z
+        self.orientation = np.array([0.0, 0.0, 0.0])  # roll, pitch, yaw
+        self.health_status = 1.0
+        self.vibration_level = 0.0
+        # [新增功能 End]
+
         # --- 2. Cognitive State Management ---
         self.state = VehicleState.IDLE
         self.mode = ControlMode.PERFORMANCE
@@ -132,7 +139,13 @@ class VehicleAgent:
         u_cmd = 0.0
         if self.state in [VehicleState.SEARCHING, VehicleState.RETURNING]:
             if not self.next_node_id:
-                self._resolve_next_hop_distributed()
+                # [新增功能 Start] 优先尝试势能场梯度导航 (Shared Location)
+                self._resolve_next_hop_gradient()
+                # [新增功能 End]
+
+                # [修改说明] 如果势能场不可用（例如无信号），回退到分布式表
+                if not self.next_node_id:
+                    self._resolve_next_hop_distributed()
 
             if self.next_node_id:
                 u_cmd = self._robust_tracking_control(dt, v_limit_ref, global_time)
@@ -146,9 +159,17 @@ class VehicleAgent:
         self.current_speed = dynamics['loco_vel']
         self._sync_kinematics(dt)
 
+        # [新增功能 Start] 同步 3D 状态 (PHM & 3D Sim)
+        self._update_kinematics_3d(dt)
+        # [新增功能 End]
+
         # 6. Event-Triggered Communication
         # Broadcast only if necessary
         self._try_broadcast_semantic(global_time)
+
+        # [新增功能 Start] 位置共享广播 (Holographic Location)
+        self._share_location_holographic(global_time)
+        # [新增功能 End]
 
         # 7. Energy Auditing
         p_inst = abs(u_cmd * dynamics['motor_current'])  # Electrical Power
@@ -156,6 +177,10 @@ class VehicleAgent:
         if abs(self.current_speed) > 0.01:
             self.dist_accumulated += abs(self.current_speed * dt)
             self.time_active += dt
+
+        # [新增功能 Start] 模拟 PHM 振动数据
+        self.vibration_level = abs(self.current_speed) * self.env['mud_factor'] * np.random.normal(1, 0.1)
+        # [新增功能 End]
 
         # 8. Telemetry Packaging
         self.last_telemetry = {
@@ -168,7 +193,11 @@ class VehicleAgent:
             'current': dynamics['motor_current'],
             'energy': self.energy.total_energy,
             'uncert': self.network_uncertainty,
-            'target': self.target_node
+            'target': self.target_node,
+            # [新增功能] 3D & PHM 数据
+            'z': self.pos_3d[2],
+            'vib': self.vibration_level,
+            'potential': 0.0  # 占位，实际可从 infra 获取
         }
         return self.last_telemetry
 
@@ -237,7 +266,7 @@ class VehicleAgent:
         Reduces bandwidth usage in weak networks.
         """
         # Calculate deviation from last broadcasted belief
-        pos_error = np.linalg.norm(self.pos_2d - self.last_broadcast_pos)
+        pos_error = np.linalg.norm(self.pos_2d - self.last_broadcast_pos[:2])  # [修改] 适配 pos_3d
 
         # Adaptive Threshold: Allow larger error when uncertainty is already high
         threshold = 2.0 * max(1.0, self.network_uncertainty)
@@ -265,11 +294,36 @@ class VehicleAgent:
                 # curr_infra.handle_async_update(packet) # Requires method in infra
 
             # Update internal state
-            self.last_broadcast_pos = self.pos_2d.copy()
+            self.last_broadcast_pos = self.pos_3d.copy()  # [修改] 适配 pos_3d
             self.last_broadcast_ts = now
 
             # Energy Cost
             self.energy.comm_joules += 0.01
+
+    # [新增功能 Start] 基于势能场的全息位置共享广播
+    def _share_location_holographic(self, now):
+        """
+        [Shared Location Method]
+        Uploads presence to the local node to contribute to the global Potential Field.
+        Efficient: Only sends when moving significantly (Event-Triggered).
+        """
+        err = np.linalg.norm(self.pos_3d - self.last_broadcast_pos)
+        if err > 5.0 or (now - self.last_broadcast_ts) > 2.0:
+            target_infra = self.infra.get(self.current_node_id)
+            if target_infra:
+                # Contribute mass to the field
+                packet = {
+                    'vid': self.id, 'eta': now, 'duration': 5.0,
+                    'pos_uncertainty': self.network_uncertainty,
+                    'timestamp': now
+                }
+                # "Fire-and-forget" update
+                target_infra.handle_semantic_packet(packet)
+
+            self.last_broadcast_pos = self.pos_3d.copy()
+            self.last_broadcast_ts = now
+
+    # [新增功能 End]
 
     # =========================================================================
     # [Module 3] Robust Control & Semantic Reservation (鲁棒控制与预约)
@@ -396,6 +450,44 @@ class VehicleAgent:
         best_n = min(neighbors, key=lambda n: np.linalg.norm(np.array(self.map.nodes[n].pos) - p_t))
         self.next_node_id = best_n
 
+    # [新增功能 Start] 基于势能场梯度的下一跳解析
+    def _resolve_next_hop_gradient(self):
+        """
+        [Navigation] Gradient Descent on Traffic Potential.
+        Vehicles naturally flow away from high-potential (crowded) nodes.
+        """
+        neighbors = list(self.map.graph.neighbors(self.current_node_id))
+        if not neighbors: return
+
+        p_t = np.array(self.map.nodes[self.target_node].pos)
+
+        best_n = None
+        min_cost = float('inf')
+
+        for n in neighbors:
+            # 1. Distance Cost
+            p_n = np.array(self.map.nodes[n].pos)
+            dist_cost = np.linalg.norm(p_n[:2] - p_t[:2])
+
+            # 2. Potential Cost (Shared Location Data)
+            # Query the infra agent for its potential level
+            potential_cost = 0.0
+            n_infra = self.infra.get(n)
+            if n_infra:
+                # Access the public broadcast state
+                state = n_infra.get_broadcast_state()
+                potential_cost = state.get('potential', 0.0) * 100.0  # Weighting
+
+            total_cost = dist_cost + potential_cost
+
+            if total_cost < min_cost:
+                min_cost = total_cost
+                best_n = n
+
+        self.next_node_id = best_n
+
+    # [新增功能 End]
+
     # =========================================================================
     # [Module 5] Physics Sync & Utilities (物理同步与辅助)
     # -------------------------------------------------------------------------
@@ -423,6 +515,27 @@ class VehicleAgent:
                 self.pos_2d = target_pos
             else:
                 self.pos_2d += (vec / dist) * step
+
+    # [新增功能 Start] 3D 状态更新
+    def _update_kinematics_3d(self, dt):
+        """Updates 3D position based on 1D track velocity."""
+        if not self.next_node_id: return
+
+        # Get target vector in 2D plane (Z is handled by terrain map later)
+        t_pos_2d = np.array(self.map.nodes[self.next_node_id].pos)
+        curr_2d = self.pos_3d[:2]
+        vec = t_pos_2d - curr_2d
+        dist = np.linalg.norm(vec)
+
+        if dist > 1e-4:
+            step = self.current_speed * dt
+            # Simple Euler integration for pos
+            move_vec = (vec / dist) * step
+            self.pos_3d[0] += move_vec[0]
+            self.pos_3d[1] += move_vec[1]
+            # self.pos_3d[2] += 0.0 # Future: Add elevation change
+
+    # [新增功能 End]
 
     def _plan_local_path(self):
         # Initial dummy path to start movement

@@ -285,6 +285,54 @@ class BayesianStateEstimator:
 # 整合 Layer 1 (物理) 和 Layer 2 (智能)，对外提供 V2I 接口。
 # =========================================================================
 
+# [新增功能 Start] 基于数字类激素的势能场类定义
+class TrafficPotentialField:
+    """
+    [Novelty] Distributed Holographic Traffic Map.
+    Uses 'Digital Pheromones' to represent vehicle density without central storage.
+    Physics-inspired diffusion process simulates information spreading.
+    """
+
+    def __init__(self, node_id, decay_rate=0.95, diffusion_rate=0.2):
+        self.node_id = node_id
+        self.local_pressure = 0.0  # Current node congestion
+        self.global_potential = 0.0  # Aggregated network potential
+        self.decay = decay_rate
+        self.diffusion = diffusion_rate
+        self.last_update = 0.0
+
+    def inject_presence(self, vehicle_mass=1.0):
+        """Vehicle registers presence -> Increases Local Pressure."""
+        self.local_pressure += vehicle_mass
+
+    def step_diffusion(self, dt, neighbor_potentials: list):
+        """
+        [Algorithm] Discrete Laplacian Diffusion.
+        dP/dt = -decay * P + diffusion * sum(P_neighbors - P_self)
+        """
+        # 1. Evaporation (Information ages and becomes less relevant)
+        self.local_pressure *= (self.decay ** dt)
+
+        # 2. Diffusion (Sharing location info via gradients)
+        if not neighbor_potentials:
+            return
+
+        avg_neighbor_p = sum(neighbor_potentials) / len(neighbor_potentials)
+        flux = self.diffusion * (avg_neighbor_p - self.global_potential) * dt
+
+        # Update Global Potential (Local Pressure is the source term)
+        self.global_potential += flux + self.local_pressure * dt
+
+        # Stability Clamp
+        self.global_potential = np.clip(self.global_potential, 0.0, 10.0)
+
+    def get_gradient(self):
+        """Returns the 'repulsive force' of this node."""
+        return self.global_potential + self.local_pressure
+
+
+# [新增功能 End]
+
 class EdgeSwitchAgent:
     """
     [Cyber-Physical System] Decentralized Edge Node.
@@ -315,6 +363,11 @@ class EdgeSwitchAgent:
         self.estimator = BayesianStateEstimator()
         self.owner_id = None  # Soft ownership based on semantic agreement
 
+        # [新增功能 Start] 初始化势能场
+        self.potential_field = TrafficPotentialField(node_id)
+        self.neighbor_potentials = []  # Cache of neighbor states for diffusion
+        # [新增功能 End]
+
     def handle_semantic_packet(self, packet):
         """
         [V2I Interface] Handles asynchronous semantic packets.
@@ -330,32 +383,53 @@ class EdgeSwitchAgent:
         # 1. Belief Update (Bayesian Filtering)
         self.estimator.update_belief(packet, current_time)
 
+        # [新增功能 Start] 注入车辆存在感（质量）到势能场，实现全息位置共享
+        self.potential_field.inject_presence(vehicle_mass=1.0)
+        # [新增功能 End]
+
         # 2. Risk Assessment (Chance-Constrained Check)
         is_safe, risk = self.estimator.get_safe_window_probabilistic(
             packet['eta'], packet['duration']
         )
 
+        # [修改说明] 兼容原有逻辑，同时返回 potential 势能值供车辆导航
+        response = {}
         if is_safe:
             # Low Risk -> Actuate Physics
             direction = packet.get('direction', 'NORMAL')
             self._set_physical_target(direction)
             self.owner_id = packet['vid']
-            return {'status': 'ACK_SEMANTIC', 'risk': risk}
+            response = {'status': 'ACK_SEMANTIC', 'risk': risk}
         else:
             # High Risk -> Reject (Vehicle must brake)
-            return {'status': 'RISK_HIGH', 'risk': risk}
+            response = {'status': 'RISK_HIGH', 'risk': risk}
+
+        # [新增功能 Start] 在响应中附加当前势能梯度
+        response['potential'] = self.potential_field.get_gradient()
+        # [新增功能 End]
+
+        return response
+
+    # [新增功能 Start] 用于接收邻居势能的接口（八卦协议）
+    def update_gossip(self, neighbor_p_list):
+        """[Network] Receive potentials from neighbors (Gossip)."""
+        self.neighbor_potentials = neighbor_p_list
+
+    # [新增功能 End]
 
     def get_broadcast_state(self):
         """
         [Digital Pheromone] Generates a compressed state packet for broadcast.
         Used by vehicles to build their local potential field map.
         """
+        # [修改说明] 增加 potential 字段广播
         return {
             'id': self.id,
             'risk_level': self.estimator.risk_level,  # Semantic Congestion
             'pos': self.mechanism.pos,  # Physical State
             'health': self.health_index,  # PHM State
-            'state': self.state.name
+            'state': self.state.name,
+            'potential': self.potential_field.get_gradient()  # [新增]
         }
 
     def _set_physical_target(self, direction):
@@ -414,6 +488,10 @@ class EdgeSwitchAgent:
 
         # 5. State Machine Transition Logic
         self._update_fsm(pos, vel, self.motor.current, dt)
+
+        # [新增功能 Start] 更新势能场扩散
+        self.potential_field.step_diffusion(dt, self.neighbor_potentials)
+        # [新增功能 End]
 
     def _update_fsm(self, pos, vel, current, dt):
         """Finite State Machine logic for phase transitions."""
