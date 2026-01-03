@@ -285,50 +285,60 @@ class BayesianStateEstimator:
 # 整合 Layer 1 (物理) 和 Layer 2 (智能)，对外提供 V2I 接口。
 # =========================================================================
 
-# [新增功能 Start] 基于数字类激素的势能场类定义
-class TrafficPotentialField:
+# [新增功能 Start] 基于全息流场熵的协同机制
+class HolographicFlowField:
     """
-    [Novelty] Distributed Holographic Traffic Map.
-    Uses 'Digital Pheromones' to represent vehicle density without central storage.
-    Physics-inspired diffusion process simulates information spreading.
+    [Novelty] Distributed Holographic Flow Map via Vector Stigmergy.
+    Diffuses not just 'density' (scalar), but 'velocity vectors' (vector).
+    Calculates Flow Entropy to determine 'Turbulence'.
     """
 
     def __init__(self, node_id, decay_rate=0.95, diffusion_rate=0.2):
         self.node_id = node_id
-        self.local_pressure = 0.0  # Current node congestion
-        self.global_potential = 0.0  # Aggregated network potential
+        # Vector Field Components: (Pressure, Vx, Vy)
+        self.local_pressure = 0.0
+        self.flow_vector = np.array([0.0, 0.0])  # Cumulative velocity vector
+        self.turbulence = 0.0  # Flow Entropy [0=Laminar, 1=Chaotic]
+
         self.decay = decay_rate
         self.diffusion = diffusion_rate
-        self.last_update = 0.0
 
-    def inject_presence(self, vehicle_mass=1.0):
-        """Vehicle registers presence -> Increases Local Pressure."""
-        self.local_pressure += vehicle_mass
+    def inject_vector(self, mass=1.0, velocity=0.0, direction_vec=None):
+        """
+        Vehicle injects (Mass, Velocity) into the field.
+        direction_vec should be normalized 2D vector.
+        """
+        self.local_pressure += mass
+        if direction_vec is not None:
+            # Accumulate momentum: Mass * Velocity * Direction
+            momentum = mass * velocity * np.array(direction_vec)
+            self.flow_vector += momentum
 
     def step_diffusion(self, dt, neighbor_potentials: list):
         """
-        [Algorithm] Discrete Laplacian Diffusion.
-        dP/dt = -decay * P + diffusion * sum(P_neighbors - P_self)
+        [Algorithm] Vector Field Diffusion.
         """
-        # 1. Evaporation (Information ages and becomes less relevant)
+        # 1. Evaporation
         self.local_pressure *= (self.decay ** dt)
+        self.flow_vector *= (self.decay ** dt)
 
-        # 2. Diffusion (Sharing location info via gradients)
-        if not neighbor_potentials:
-            return
+        # 2. Calculate Turbulence (Entropy of the Flow)
+        # Turbulence = 1.0 - (Magnitude of Mean Vector / Mean of Magnitudes)
+        # Simplified: If pressure is high but net flow is low -> High Turbulence (Jam)
+        speed_mag = np.linalg.norm(self.flow_vector)
+        if self.local_pressure > 0.1:
+            # Order Parameter (0 to 1)
+            order = speed_mag / (self.local_pressure * 15.0 + 1e-5)  # Normalize by max speed assumption
+            self.turbulence = 1.0 - np.clip(order, 0.0, 1.0)
+        else:
+            self.turbulence = 0.0  # Empty = Laminar
 
-        avg_neighbor_p = sum(neighbor_potentials) / len(neighbor_potentials)
-        flux = self.diffusion * (avg_neighbor_p - self.global_potential) * dt
-
-        # Update Global Potential (Local Pressure is the source term)
-        self.global_potential += flux + self.local_pressure * dt
-
-        # Stability Clamp
-        self.global_potential = np.clip(self.global_potential, 0.0, 10.0)
-
-    def get_gradient(self):
-        """Returns the 'repulsive force' of this node."""
-        return self.global_potential + self.local_pressure
+    def get_flow_state(self):
+        """Returns the state of the flow field for navigation."""
+        return {
+            'potential': self.local_pressure,
+            'turbulence': self.turbulence
+        }
 
 
 # [新增功能 End]
@@ -363,8 +373,8 @@ class EdgeSwitchAgent:
         self.estimator = BayesianStateEstimator()
         self.owner_id = None  # Soft ownership based on semantic agreement
 
-        # [新增功能 Start] 初始化势能场
-        self.potential_field = TrafficPotentialField(node_id)
+        # [新增功能 Start] 初始化全息流场
+        self.flow_field = HolographicFlowField(node_id)
         self.neighbor_potentials = []  # Cache of neighbor states for diffusion
         # [新增功能 End]
 
@@ -374,17 +384,20 @@ class EdgeSwitchAgent:
         This method is 'Fire-and-Forget' compatible (No ACK required for protocol correctness).
 
         Args:
-            packet: {vid, eta, duration, pos_uncertainty, direction, global_time}
+            packet: {vid, eta, duration, pos_uncertainty, direction, global_time, velocity_vec}
         Returns:
-            dict: {status, risk} (Immediate feedback, though transmission may be lossy)
+            dict: {status, risk, turbulence}
         """
         current_time = packet.get('global_time', 0.0)
 
         # 1. Belief Update (Bayesian Filtering)
         self.estimator.update_belief(packet, current_time)
 
-        # [新增功能 Start] 注入车辆存在感（质量）到势能场，实现全息位置共享
-        self.potential_field.inject_presence(vehicle_mass=1.0)
+        # [新增功能 Start] 注入全息流场 (Vector Injection)
+        vel = packet.get('vel', 0.0)
+        # Use velocity vector if available, or just scalar mass
+        # For simplicity in 1D/Graph logic, we use scalar mass + speed magnitude
+        self.flow_field.inject_vector(mass=1.0, velocity=vel, direction_vec=[1, 0])  # Simplified dir
         # [新增功能 End]
 
         # 2. Risk Assessment (Chance-Constrained Check)
@@ -392,7 +405,6 @@ class EdgeSwitchAgent:
             packet['eta'], packet['duration']
         )
 
-        # [修改说明] 兼容原有逻辑，同时返回 potential 势能值供车辆导航
         response = {}
         if is_safe:
             # Low Risk -> Actuate Physics
@@ -404,8 +416,11 @@ class EdgeSwitchAgent:
             # High Risk -> Reject (Vehicle must brake)
             response = {'status': 'RISK_HIGH', 'risk': risk}
 
-        # [新增功能 Start] 在响应中附加当前势能梯度
-        response['potential'] = self.potential_field.get_gradient()
+        # [新增功能 Start] 在响应中附加流场湍流度 (Turbulence)
+        # 车辆将根据此值决定是否启用“全息协同模式”
+        flow_state = self.flow_field.get_flow_state()
+        response['turbulence'] = flow_state['turbulence']
+        response['potential'] = flow_state['potential']
         # [新增功能 End]
 
         return response
@@ -422,14 +437,16 @@ class EdgeSwitchAgent:
         [Digital Pheromone] Generates a compressed state packet for broadcast.
         Used by vehicles to build their local potential field map.
         """
-        # [修改说明] 增加 potential 字段广播
+        flow = self.flow_field.get_flow_state()
+        # [修改说明] 增加 potential 和 turbulence 字段广播
         return {
             'id': self.id,
             'risk_level': self.estimator.risk_level,  # Semantic Congestion
             'pos': self.mechanism.pos,  # Physical State
             'health': self.health_index,  # PHM State
             'state': self.state.name,
-            'potential': self.potential_field.get_gradient()  # [新增]
+            'potential': flow['potential'],  # [新增]
+            'turbulence': flow['turbulence']  # [新增]
         }
 
     def _set_physical_target(self, direction):
@@ -489,8 +506,8 @@ class EdgeSwitchAgent:
         # 5. State Machine Transition Logic
         self._update_fsm(pos, vel, self.motor.current, dt)
 
-        # [新增功能 Start] 更新势能场扩散
-        self.potential_field.step_diffusion(dt, self.neighbor_potentials)
+        # [新增功能 Start] 更新全息流场扩散
+        self.flow_field.step_diffusion(dt, self.neighbor_potentials)
         # [新增功能 End]
 
     def _update_fsm(self, pos, vel, current, dt):

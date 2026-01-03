@@ -133,11 +133,20 @@ class GridMap:
         depots = self.cfg['topology'].get('depots', {})
         for name, coords in depots.items():
             self._add_node(name, tuple(coords), has_switch=False)
-            # 寻找最近的骨干节点进行连接
-            closest = min(self.nodes.keys(),
-                          key=lambda n: np.linalg.norm(np.array(self.nodes[n].pos) - np.array(coords)))
-            self._add_edge(name, closest)
-            self._add_edge(closest, name)
+
+            # [关键修复] 寻找最近的骨干节点进行连接
+            # 必须排除自己，且只连接到骨干节点 (N_)，避免连到 Stop_H 导致逻辑复杂
+            candidates = [n for n in self.nodes.keys() if n.startswith("N_")]
+
+            if candidates:
+                closest = min(candidates,
+                              key=lambda n: np.linalg.norm(np.array(self.nodes[n].pos) - np.array(coords)))
+
+                self._add_edge(name, closest)
+                self._add_edge(closest, name)
+                logger.info(f"Connected Depot {name} <--> {closest}")
+            else:
+                logger.warning(f"Depot {name} could not find a connection point!")
 
     def _add_node(self, nid, pos, has_switch):
         # 获取该位置的局部环境参数

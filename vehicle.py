@@ -2,6 +2,7 @@ import numpy as np
 import logging
 import random
 import math
+import networkx as nx  # [新增] 引入图算法库，用于本地路径规划兜底
 from enum import Enum, auto
 from collections import deque
 from dataclasses import dataclass
@@ -21,11 +22,13 @@ logger = logging.getLogger("Edge.Vehicle")
 
 class ControlMode(Enum):
     """
-    [Adaptive Control] Operational modes based on Network Quality (AoI).
+    [Adaptive Control] Operational modes based on Network Quality & Flow Entropy.
     """
-    PERFORMANCE = auto()  # Strong Net: High speed, tight spacing (MPC enabled)
-    ROBUST = auto()  # Weak Net: Reduced speed, larger gaps (Conservative P-Control)
-    EMERGENCY = auto()  # No Net: Crawl or Stop (Safety Critical)
+    # [修改] 替代原 PERFORMANCE。弱网下基于流场有序度的高效协同模式
+    HOLO_COOP = auto()  # Low Turbulence (Ordered Flow) -> High speed, tight spacing
+
+    ROBUST = auto()  # High Turbulence (Chaotic Flow) -> Reduced speed, larger gaps
+    EMERGENCY = auto()  # No Signal -> Crawl or Stop (Safety Critical)
 
 
 class VehicleState(Enum):
@@ -97,7 +100,7 @@ class VehicleAgent:
 
         # --- 2. Cognitive State Management ---
         self.state = VehicleState.IDLE
-        self.mode = ControlMode.PERFORMANCE
+        self.mode = ControlMode.HOLO_COOP  # [修改] 默认全息协同
         self.home_node = start_node
         self.target_node = self._hash_food_target()
 
@@ -110,6 +113,9 @@ class VehicleAgent:
         # AoI & Uncertainty State
         self.network_uncertainty = 0.0  # Sigma (Position variance)
         self.last_comm_ts = -100.0  # Last successful handshake
+
+        # [新增] 局部流场湍流度感知
+        self.local_turbulence = 0.0
 
         # Event-Triggered Comms State
         self.last_broadcast_ts = -100.0
@@ -128,8 +134,8 @@ class VehicleAgent:
         [Main Control Loop] Frequency: 1/dt Hz
         Execution Order: Sense -> Assess -> Plan -> Control -> Actuate -> Communicate
         """
-        # 1. Network Assessment (AoI Logic)
-        # Determine reliability of the environment
+        # 1. Network Assessment (Holographic Flow Logic)
+        # Determine reliability using Flow Entropy, not just AoI
         self._assess_network_condition(global_time)
 
         # 2. State Machine & High-Level Planning
@@ -157,7 +163,7 @@ class VehicleAgent:
                 if not self.next_node_id:
                     self._resolve_next_hop_distributed()
 
-            if self.next_node_id:
+            if self.next_node_id or self.path_queue:
                 u_cmd = self._robust_tracking_control(dt, v_limit_ref, global_time)
 
         elif self.state == VehicleState.BRAKING_NORMAL:
@@ -223,36 +229,44 @@ class VehicleAgent:
     # =========================================================================
     # [Module 1] Network Awareness & Adaptation (网络感知与自适应)
     # -------------------------------------------------------------------------
-    # 实现 "可取之处 1": 信息新鲜度感知与控制模式动态切换
+    # 实现 "可取之处 1": 基于流场熵的模态切换 (替代原有的强网判断)
     # =========================================================================
 
     def _assess_network_condition(self, now):
         """
-        Assess local infrastructure availability to estimate AoI.
-        Adjusts 'network_uncertainty' and switches 'ControlMode'.
+        [Novelty] Holographic Flow Assessment.
+        Decides mode based on 'Turbulence' (Flow Entropy), not just AoI.
         """
         # [优化] 如果在 Start 节点 (车库)，认为是该区域有线连接，信号满格
         if "Start" in str(self.current_node_id):
             aoi = 0.0
+            turbulence = 0.0
         else:
             # Check connectivity to current node's edge agent
             curr_infra = self.infra.get(self.current_node_id)
             if curr_infra:
+                state = curr_infra.get_broadcast_state()
                 aoi = 0.1
+                # [新增] 获取流场湍流度
+                turbulence = state.get('turbulence', 0.0)
             else:
                 aoi = 5.0  # Weak signal area assumption
+                turbulence = 1.0  # Unknown -> Assume Chaotic
 
         # Uncertainty grows linearly with AoI
-        # Sigma = Base_Error + Drift_Rate * AoI
         self.network_uncertainty = 0.5 + 0.2 * aoi
+        self.local_turbulence = turbulence
 
-        # Mode Switching Logic
-        if aoi < 1.0:
-            self.mode = ControlMode.PERFORMANCE
-        elif aoi < 10.0:
-            self.mode = ControlMode.ROBUST
-        else:
+        # [核心创新点] 模式切换逻辑重构
+        # 原逻辑：AoI 低 -> Performance
+        # 新逻辑：流场有序 (低湍流) -> Holo Coop (即使是弱网)
+
+        if aoi > 10.0:  # 彻底无信号
             self.mode = ControlMode.EMERGENCY
+        elif turbulence < 0.3:  # 流场有序，可以高效协同
+            self.mode = ControlMode.HOLO_COOP
+        else:  # 流场混乱，降级为鲁棒模式
+            self.mode = ControlMode.ROBUST
 
     def _get_speed_limit(self):
         """
@@ -299,6 +313,7 @@ class VehicleAgent:
             # In a real impl, this would call comms.send(packet)
 
             # Here we update the "Digital Twin" state locally to simulate successful TX
+            # Note: The 'infrastructure' actually receives this via async calls if we wired it up.
             curr_infra = self.infra.get(self.current_node_id)
             if curr_infra:
                 packet = {
@@ -334,7 +349,8 @@ class VehicleAgent:
                 packet = {
                     'vid': self.id, 'eta': now, 'duration': 5.0,
                     'pos_uncertainty': self.network_uncertainty,
-                    'timestamp': now
+                    'timestamp': now,
+                    'vel': self.current_speed  # [新增] 上传速度用于计算流场
                 }
                 # "Fire-and-forget" update
                 target_infra.handle_semantic_packet(packet)
@@ -395,7 +411,8 @@ class VehicleAgent:
         if dist < 1.0:
             self.current_node_id = target_id
             self.next_node_id = None  # Clear next hop
-            if self.path_queue: self.path_queue.popleft()
+            if self.path_queue and self.path_queue[0] == target_id:
+                self.path_queue.popleft()
             return 0.0
 
         # Velocity Error
@@ -562,8 +579,23 @@ class VehicleAgent:
     # [新增功能 End]
 
     def _plan_local_path(self):
-        # Initial dummy path to start movement
-        self.path_queue = deque()  # Cleared, will use _resolve_next_hop_distributed
+        """
+        [关键修复] 使用 NetworkX 进行初始路径规划 (Onboard Planning)。
+        解决 SEARCHING 初始阶段 path_queue 为空导致不动的 Bug。
+        """
+        try:
+            # 计算从当前点到目标点的最短路
+            path = nx.shortest_path(self.map.graph, self.current_node_id, self.target_node)
+            # 移除起始点（即当前点）
+            if path and path[0] == self.current_node_id:
+                path.pop(0)
+
+            self.path_queue = deque(path)
+            logger.info(f"Vehicle {self.id} initialized path: {list(self.path_queue)}")
+        except Exception as e:
+            # 规划失败（如目标不可达），清空队列，依赖分布式导航
+            logger.warning(f"Local planning failed for {self.id}: {e}")
+            self.path_queue = deque()
 
     def _plan_mission(self):
         # 简单的硬编码任务，用于测试
