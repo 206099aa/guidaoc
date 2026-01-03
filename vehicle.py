@@ -38,6 +38,8 @@ class VehicleState(Enum):
     RETURNING = auto()  # Inbound: High speed cruising
     UNLOADING = auto()  # At Depot
     FAULT_RECOVERY = auto()  # PHM Triggered
+    TRACTION_CONTROL = auto()  # [修复] 兼容旧任务逻辑的状态
+    BRAKING_NORMAL = auto()  # [修复] 兼容旧任务逻辑的状态
 
 
 @dataclass
@@ -137,7 +139,15 @@ class VehicleAgent:
         # 3. Robust Tracking Control (MPC + Semantic Reservation)
         # Calculate voltage command for physics engine
         u_cmd = 0.0
-        if self.state in [VehicleState.SEARCHING, VehicleState.RETURNING]:
+
+        # [关键修复] 将 TRACTION_CONTROL 加入活跃控制状态列表
+        active_moving_states = [
+            VehicleState.SEARCHING,
+            VehicleState.RETURNING,
+            VehicleState.TRACTION_CONTROL
+        ]
+
+        if self.state in active_moving_states:
             if not self.next_node_id:
                 # [新增功能 Start] 优先尝试势能场梯度导航 (Shared Location)
                 self._resolve_next_hop_gradient()
@@ -149,6 +159,13 @@ class VehicleAgent:
 
             if self.next_node_id:
                 u_cmd = self._robust_tracking_control(dt, v_limit_ref, global_time)
+
+        elif self.state == VehicleState.BRAKING_NORMAL:
+            # 简单的停车阻尼控制
+            if abs(self.current_speed) > 0.1:
+                u_cmd = -48.0 if self.current_speed > 0 else 48.0
+            else:
+                u_cmd = 0.0
 
         # 4. Physical Actuation (RK4 Integration)
         # Apply voltage, simulate motor & mechanics
@@ -194,6 +211,8 @@ class VehicleAgent:
             'energy': self.energy.total_energy,
             'uncert': self.network_uncertainty,
             'target': self.target_node,
+            # [关键修复] 添加质量数据，修复表格显示
+            'mass_total': self.physics.mass_total,
             # [新增功能] 3D & PHM 数据
             'z': self.pos_3d[2],
             'vib': self.vibration_level,
@@ -212,15 +231,16 @@ class VehicleAgent:
         Assess local infrastructure availability to estimate AoI.
         Adjusts 'network_uncertainty' and switches 'ControlMode'.
         """
-        # Check connectivity to current node's edge agent
-        curr_infra = self.infra.get(self.current_node_id)
-
-        if curr_infra:
-            # Simulate AoI: Low if infra is present, High if dead zone
-            # In a real system, this would check 'last_seen' timestamp of beacons
-            aoi = 0.1
+        # [优化] 如果在 Start 节点 (车库)，认为是该区域有线连接，信号满格
+        if "Start" in str(self.current_node_id):
+            aoi = 0.0
         else:
-            aoi = 5.0  # Weak signal area assumption
+            # Check connectivity to current node's edge agent
+            curr_infra = self.infra.get(self.current_node_id)
+            if curr_infra:
+                aoi = 0.1
+            else:
+                aoi = 5.0  # Weak signal area assumption
 
         # Uncertainty grows linearly with AoI
         # Sigma = Base_Error + Drift_Rate * AoI
@@ -279,7 +299,6 @@ class VehicleAgent:
             # In a real impl, this would call comms.send(packet)
 
             # Here we update the "Digital Twin" state locally to simulate successful TX
-            # Note: The 'infrastructure' actually receives this via async calls if we wired it up.
             curr_infra = self.infra.get(self.current_node_id)
             if curr_infra:
                 packet = {
@@ -367,7 +386,6 @@ class VehicleAgent:
                 # React to Risk
                 if response['status'] == 'RISK_HIGH':
                     # High Collision Probability -> Emergency Brake
-                    # Override Speed Limit
                     return -48.0  # Max Braking Voltage
 
         # 2. Tracking Controller (Simplified MPC/P-Control)
@@ -403,6 +421,12 @@ class VehicleAgent:
             if self.wait_timer <= 0:
                 self.state = VehicleState.SEARCHING
                 self._plan_local_path()  # Initialize path
+
+        # [修复] 增加对 TRACTION_CONTROL 的支持 (用于固定任务)
+        elif self.state == VehicleState.TRACTION_CONTROL:
+            if not self.path_queue:
+                self.state = VehicleState.BRAKING_NORMAL
+            v_target = self._get_speed_limit()
 
         elif self.state == VehicleState.SEARCHING:
             v_target = self._get_speed_limit()
@@ -540,6 +564,15 @@ class VehicleAgent:
     def _plan_local_path(self):
         # Initial dummy path to start movement
         self.path_queue = deque()  # Cleared, will use _resolve_next_hop_distributed
+
+    def _plan_mission(self):
+        # 简单的硬编码任务，用于测试
+        # [修改] 使用正确的距离逻辑，避免直接寻路到远端导致的计算误差
+        if "Hauler" in self.id:
+            # 假设 Start_1 连接到 N_0_3 (根据地图生成逻辑估算)
+            self.path_queue = deque(["N_0_3", "N_0_2", "Stop_H_0_2"])
+        else:
+            self.path_queue = deque(["N_2_0", "N_2_1", "Stop_H_2_1"])
 
     def _hash_food_target(self):
         # Deterministic random target
