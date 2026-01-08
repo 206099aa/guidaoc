@@ -34,7 +34,6 @@ class DecentralizedSimulation:
         self.map = GridMap(self.cfg)
 
         # 收集所有的道岔代理 (Infrastructure Agents)
-        # 格式: {node_id: EdgeSwitchAgent}
         self.infra_agents = {
             nid: node.agent
             for nid, node in self.map.nodes.items()
@@ -43,34 +42,49 @@ class DecentralizedSimulation:
         logger.info(f"Deployed {len(self.infra_agents)} Edge Switch Agents.")
 
         # 2. 初始化车辆智能体 (Vehicle Agents)
-        logger.info("Deploying Autonomous Vehicles...")
+        logger.info("Deploying Autonomous Vehicles (4 Units)...")
         self.vehicles = []
 
-        # --- V1: Heavy Hauler (Logistics) ---
-        v1_type = "Heavy_Hauler"
-        v1 = VehicleAgent(
-            agent_id="HV_Hauler_01",
-            vehicle_type_cfg=self.cfg['vehicle_types'][v1_type],  # 直接传入该车型的配置字典
-            env_config=self.env_cfg,
-            start_node="Start_1",
-            map_graph=self.map,
-            infra_agents=self.infra_agents  # 传入字典索引，而非列表
-        )
-        self.vehicles.append(v1)
+        # 定义车辆编队配置 (4车: 每个起点各2辆，混编)
+        fleet_config = [
+            # --- Group 1: From Start_1 ---
+            {
+                "id": "HV_Hauler_01",
+                "type": "Heavy_Hauler",
+                "start": "Start_1"
+            },
+            {
+                "id": "FS_Scout_01",
+                "type": "Fast_Scout",
+                "start": "Start_1"
+            },
+            # --- Group 2: From Start_2 ---
+            {
+                "id": "HV_Hauler_02",
+                "type": "Heavy_Hauler",
+                "start": "Start_2"
+            },
+            {
+                "id": "FS_Scout_02",
+                "type": "Fast_Scout",
+                "start": "Start_2"
+            }
+        ]
 
-        # --- V2: Fast Scout (Inspection) ---
-        v2_type = "Fast_Scout"
-        v2 = VehicleAgent(
-            agent_id="FS_Scout_02",
-            vehicle_type_cfg=self.cfg['vehicle_types'][v2_type],
-            env_config=self.env_cfg,
-            start_node="Start_2",
-            map_graph=self.map,
-            infra_agents=self.infra_agents
-        )
-        self.vehicles.append(v2)
+        # 批量实例化
+        for v_conf in fleet_config:
+            v_agent = VehicleAgent(
+                agent_id=v_conf["id"],
+                vehicle_type_cfg=self.cfg['vehicle_types'][v_conf["type"]],
+                env_config=self.env_cfg,
+                start_node=v_conf["start"],
+                map_graph=self.map,
+                infra_agents=self.infra_agents
+            )
+            self.vehicles.append(v_agent)
+            logger.info(f" -> Deployed {v_conf['id']} at {v_conf['start']}")
 
-        # [SCI Depth] 注入 V2V 引用 (如果 vehicle.py 中需要进行车辆间通信/防撞)
+        # [SCI Depth] 注入 V2V 引用 (全连接拓扑，用于模拟硬件广播)
         for v in self.vehicles:
             v.all_vehicles = self.vehicles
 
@@ -115,10 +129,9 @@ class DecentralizedSimulation:
             t = 0.0
             step_count = 0
 
-            # [视觉优化] 渲染倍速设置
-            # 每计算 20 次物理帧，才画 1 次图
-            # 这样视觉速度会变快 20 倍，看着车就跑得快了
-            RENDER_SKIP = 20
+            # [视觉优化] 渲染倍速设置 (100倍物理帧跳过)
+            # 相当于 50 倍速播放，避免等待
+            RENDER_SKIP = 100
 
             while t < duration:
                 self.step(t, dt)

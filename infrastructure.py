@@ -13,7 +13,6 @@ logger = logging.getLogger("Edge.Infrastructure")
 # [Layer 1] High-Fidelity Physics Kernel (高保真物理内核)
 # -------------------------------------------------------------------------
 # 包含 ZD6 转辙机的机电热耦合模型、非线性摩擦与机械锁闭逻辑。
-# 对应 DeepSnake 版本的核心优势：物理真实性与 PHM 基础。
 # =========================================================================
 
 class SwitchState(Enum):
@@ -211,10 +210,11 @@ class BayesianStateEstimator:
         propagated_sigma = base_sigma + 0.2 * aoi  # Linear uncertainty growth model
 
         # 3. Update Belief State
+        # [Fix] Added .get() with defaults to prevent KeyError if 'eta'/'duration' missing
         self.occupancy_map[vid] = SemanticOccupancy(
             owner_id=vid,
-            arrival_mean=packet['eta'],
-            duration_mean=packet['duration'],
+            arrival_mean=packet.get('eta', current_time),
+            duration_mean=packet.get('duration', 2.0),
             uncertainty_sigma=propagated_sigma,
             last_update_ts=current_time
         )
@@ -375,10 +375,25 @@ class EdgeSwitchAgent:
         self.reservations = [s for s in self.reservations if s.end_time > arrival_time - 100.0]
         return True
 
+    def check_reservation_status(self, vid, current_time):
+        """
+        [关键修复] 严格执法：
+        1. 如果当前时间段被别人占用 -> 拒绝 (冲突)
+        2. 如果被自己占用 -> 允许
+        3. 如果无人占用 -> 允许 (或视为空闲)
+        """
+        for slot in self.reservations:
+            # 检查当前时刻是否在某个 Slot 内
+            if slot.start_time <= current_time <= slot.end_time:
+                if slot.owner_id != vid:
+                    return False  # 被他人锁定
+        return True  # 空闲或自己锁定
+
     # --- [Interface Handlers] ---
     def handle_semantic_packet(self, packet):
         """[V2I] Async Semantic Packet Handler."""
         current_time = packet.get('global_time', 0.0)
+        vid = packet['vid']
 
         # 1. Belief Update
         self.estimator.update_belief(packet, current_time)
@@ -387,20 +402,26 @@ class EdgeSwitchAgent:
         vel = packet.get('vel', 0.0)
         self.flow_field.inject_vector(mass=1.0, velocity=vel, direction_vec=[1, 0])
 
-        # 3. Risk Assessment
-        is_safe, risk = self.estimator.get_safe_window_probabilistic(
-            packet['eta'], packet['duration']
+        # 3. Security Check (Double Validation)
+        # A. 概率检查 (Bayesian)
+        is_safe_prob, risk_val = self.estimator.get_safe_window_probabilistic(
+            packet.get('eta', current_time), packet.get('duration', 2.0)
         )
 
+        # B. 确定性检查 (Reservation Table) - [新增]
+        is_safe_deter = self.check_reservation_status(vid, current_time)
+
         response = {}
-        if is_safe:
-            # Low Risk -> Actuate Physics (Soft Reservation)
+        # 只要有一方认为不安全，就视为高风险
+        if is_safe_prob and is_safe_deter:
             direction = packet.get('direction', 'NORMAL')
             self._set_physical_target(direction)
-            self.owner_id = packet['vid']
-            response = {'status': 'ACK_SEMANTIC', 'risk': risk}
+            self.owner_id = vid
+            response = {'status': 'ACK_SEMANTIC', 'risk': risk_val}
         else:
-            response = {'status': 'RISK_HIGH', 'risk': risk}
+            # 确定性冲突通常意味着硬碰撞风险，Risk 设为最高
+            final_risk = 1.0 if not is_safe_deter else risk_val
+            response = {'status': 'RISK_HIGH', 'risk': final_risk}
 
         # Attach Flow State
         flow_state = self.flow_field.get_flow_state()

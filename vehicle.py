@@ -244,6 +244,7 @@ class VehicleAgent:
             'id': self.id, 'state': self.state.name, 'mode': self.mode.name,
             'pos': self.pos_2d, 'vel': self.current_speed,
             'force': dynamics['coupler_force_1'], 'current': dynamics['motor_current'],
+            'mu': dynamics.get('mu_effective', 0.0),
             'energy': self.energy.total_energy, 'mass_total': self.physics.mass_total,
             'z': self.pos_3d[2], 'vib': self.vibration_level,
             'potential': 0.0
@@ -330,15 +331,23 @@ class VehicleAgent:
 
                 infra = self.infra.get(v)
                 if infra:
-                    # 尝试预约
-                    if infra.query_time_space(curr_t, duration):
-                        # 冲突！此处应触发重规划或等待
-                        # 简化处理：标记为冲突，回退到普通逻辑
-                        # valid_path = False
-                        pass
-                    infra.reserve_time_space(self.id, curr_t, duration)
+                    # [关键修复] 如果时间窗冲突，尝试推迟进入时间 (Wait logic)
+                    wait_time = 0.0
+                    max_wait = 60.0
 
-                curr_t += duration
+                    # 循环检测：直到找到空闲窗口
+                    while infra.query_time_space(curr_t + wait_time, duration):
+                        wait_time += 2.0  # 每次推迟2秒
+                        if wait_time > max_wait:
+                            break  # 超时，只能硬着头皮上了(依靠MPC避障)
+
+                    final_start_t = curr_t + wait_time
+                    infra.reserve_time_space(self.id, final_start_t, duration)
+
+                    # 更新当前规划时间
+                    curr_t = final_start_t + duration
+                else:
+                    curr_t += duration  # 无基站，直接累加时间
 
             if path and path[0] == self.current_node_id: path.pop(0)
             self.path_queue = deque(path)
@@ -569,31 +578,72 @@ class VehicleAgent:
             self.mode = ControlMode.HARDWARE_V2X
 
     def _update_mission_logic(self, dt):
+        """
+        [Mission Loop]
+        Revised Logic: IDLE(Home) -> LOADING(Home) -> SEARCHING(To Target) -> UNLOADING(Target) -> RETURNING(Home)
+        Includes dynamic loading times based on wagon count.
+        """
+        # 获取车厢数量 (如果 Physics 中未定义，默认 1)
+        wagons = getattr(self.physics, 'num_wagons', 1)
+        # 动态装卸时间：基础 3秒 + 每车厢 2秒
+        op_time = 3.0 + wagons * 2.0
+
         if self.state == VehicleState.IDLE:
             self.wait_timer -= dt
             if self.wait_timer <= 0:
-                self.state = VehicleState.SEARCHING
-        elif self.state == VehicleState.SEARCHING:
-            if self.current_node_id == self.target_node:
+                # 休息结束，开始装货 (Loading at Home)
                 self.state = VehicleState.LOADING
-                self.wait_timer = 2.0
+                self.wait_timer = op_time
+                logger.info(f"[{self.id}] State: IDLE -> LOADING (Duration: {op_time:.1f}s)")
+
         elif self.state == VehicleState.LOADING:
             self.wait_timer -= dt
             if self.wait_timer <= 0:
-                self.state = VehicleState.RETURNING
-                self.target_node = self.home_node
-                self.next_node_id = None
-                self.path_queue.clear()  # 强制重规划回程
-        elif self.state == VehicleState.RETURNING:
+                # 装货完成，出发送货 (Search/Deliver)
+                self.state = VehicleState.SEARCHING
+                # 确保有目标
+                if not self.target_node or self.target_node == self.home_node:
+                    self.target_node = self._hash_food_target()
+
+                # 触发寻路
+                if self.mode == ControlMode.PERFORMANCE:
+                    self._plan_spacetime_optimal(0)
+                else:
+                    self._plan_local_path_static()
+
+                logger.info(f"[{self.id}] State: LOADING -> SEARCHING (Target: {self.target_node})")
+
+        elif self.state == VehicleState.SEARCHING:
             if self.current_node_id == self.target_node:
+                # 到达终点，开始卸货
                 self.state = VehicleState.UNLOADING
-                self.wait_timer = 3.0
+                self.wait_timer = op_time
+                logger.info(f"[{self.id}] State: SEARCHING -> UNLOADING")
+
         elif self.state == VehicleState.UNLOADING:
             self.wait_timer -= dt
             if self.wait_timer <= 0:
+                # 卸货完成，返程回家
+                self.state = VehicleState.RETURNING
+                self.target_node = self.home_node
+                self.next_node_id = None
+                self.path_queue.clear()
+
+                if self.mode == ControlMode.PERFORMANCE:
+                    self._plan_spacetime_optimal(0)
+                else:
+                    self._plan_local_path_static()
+
+                logger.info(f"[{self.id}] State: UNLOADING -> RETURNING (Home: {self.home_node})")
+
+        elif self.state == VehicleState.RETURNING:
+            if self.current_node_id == self.target_node:
+                # 到家，休息
                 self.state = VehicleState.IDLE
+                self.wait_timer = 5.0  # Rest time
+                # 计算下一轮的目标
                 self.target_node = self._hash_food_target()
-                self.wait_timer = 5.0
+                logger.info(f"[{self.id}] State: RETURNING -> IDLE")
 
     def _sync_kinematics(self, dt):
         tid = self.next_node_id if self.next_node_id else (self.path_queue[0] if self.path_queue else None)
@@ -620,9 +670,16 @@ class VehicleAgent:
         if err > 1.0 or (now - self.last_broadcast_ts) > 5.0:
             curr_infra = self.infra.get(self.current_node_id)
             if curr_infra:
+                # [Fix] Added 'eta' and 'duration' to payload to prevent KeyError in Infrastructure
                 packet = {
-                    'vid': self.id, 'pos': self.pos_2d, 'vel': self.current_speed,
-                    'timestamp': now, 'pos_uncertainty': self.network_uncertainty
+                    'vid': self.id,
+                    'pos': self.pos_2d,
+                    'vel': self.current_speed,
+                    'timestamp': now,
+                    'pos_uncertainty': self.network_uncertainty,
+                    'eta': now,
+                    'duration': 2.0,
+                    'direction': 'NORMAL'
                 }
                 curr_infra.handle_semantic_packet(packet)
             self.last_broadcast_pos = self.pos_3d.copy()

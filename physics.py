@@ -53,7 +53,7 @@ class PolachContactModel:
         mu_available = max(mu_available, 0.3)
 
         if abs(creepage) < 1e-4:
-            return 0.0, mu_available
+            return 0.0, 0.0
 
         # 蠕滑特性曲线 (较陡峭，响应快)
         k_creep = 30.0
@@ -61,7 +61,7 @@ class PolachContactModel:
         # 使用 tanh 模拟饱和特性
         mu_eff = mu_available * np.tanh(abs(tau))
 
-        return normal_force * mu_eff * np.sign(creepage), mu_available
+        return normal_force * mu_eff * np.sign(creepage), mu_eff
 
 
 class DCMotorModel:
