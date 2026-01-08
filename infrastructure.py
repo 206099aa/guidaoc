@@ -170,7 +170,6 @@ class ZD6Mechanism:
 # [Layer 2] SCI-Grade Semantic Edge Intelligence (语义智能层)
 # -------------------------------------------------------------------------
 # 包含贝叶斯状态估计、概率风险评估与信息老化机制。
-# 对应 RobustSnake 版本的核心优势：弱网适配性与分布鲁棒性。
 # =========================================================================
 
 @dataclass
@@ -178,7 +177,6 @@ class SemanticOccupancy:
     """
     [Semantic Data Structure]
     Represents a probabilistic belief of resource usage.
-    Unlike a deterministic lock, this includes uncertainty metrics.
     """
     owner_id: str
     arrival_mean: float  # Estimated Time of Arrival (ETA)
@@ -201,20 +199,14 @@ class BayesianStateEstimator:
     def update_belief(self, packet, current_time):
         """
         Injects a new semantic measurement into the belief state.
-
-        Args:
-            packet: {vid, eta, duration, pos_uncertainty, timestamp}
-            current_time: Global simulation time
         """
         vid = packet['vid']
         packet_ts = packet.get('timestamp', current_time)
 
         # 1. Calculate Age of Information (AoI)
-        # AoI represents the freshness of the data. High AoI -> High Uncertainty.
         aoi = max(0.0, current_time - packet_ts)
 
         # 2. Uncertainty Propagation
-        # Sigma(t) = Sigma_reported + alpha * AoI
         base_sigma = packet.get('pos_uncertainty', 1.0)
         propagated_sigma = base_sigma + 0.2 * aoi  # Linear uncertainty growth model
 
@@ -227,14 +219,11 @@ class BayesianStateEstimator:
             last_update_ts=current_time
         )
 
-        # 4. Maintenance: Prune stale beliefs to prevent ghost blockages
+        # 4. Maintenance: Prune stale beliefs
         self._prune_stale_beliefs(current_time)
 
     def _prune_stale_beliefs(self, now):
-        """
-        Removes beliefs that have exceeded the validity horizon (Robustness).
-        Threshold: 60s (Assumed max coherence time in weak net).
-        """
+        """Removes beliefs that have exceeded the validity horizon (Robustness)."""
         dead_keys = []
         for vid, occ in self.occupancy_map.items():
             if (now - occ.last_update_ts) > 60.0:
@@ -243,49 +232,41 @@ class BayesianStateEstimator:
         for k in dead_keys:
             del self.occupancy_map[k]
 
-        # Update aggregate risk metric (Entropy proxy)
-        # Simple heuristic: more occupants = higher risk
+        # Update aggregate risk metric
         self.risk_level = min(1.0, len(self.occupancy_map) * 0.25)
 
     def get_safe_window_probabilistic(self, req_eta, req_dur):
         """
         [Core Logic] Probabilistic Collision Detection.
-        Instead of checking deterministic overlap, we check Gaussian overlap probability.
-
-        Returns:
-            (is_safe: bool, risk_score: float)
+        Returns: (is_safe: bool, risk_score: float)
         """
         risk_accum = 0.0
         req_start = req_eta
         req_end = req_eta + req_dur
 
         for vid, occ in self.occupancy_map.items():
-            # Construct Confidence Interval (3-Sigma Rule -> 99.7%)
+            # Construct Confidence Interval (3-Sigma Rule)
             buffer = 3.0 * occ.uncertainty_sigma
-
             occ_start = occ.arrival_mean - buffer
             occ_end = occ.arrival_mean + occ.duration_mean + buffer
 
-            # Intersection over Union (IoU) Logic for 1D time intervals
+            # Intersection over Union (IoU) Logic
             overlap_start = max(req_start, occ_start)
             overlap_end = min(req_end, occ_end)
 
             if overlap_start < overlap_end:
-                # Collision detected in belief space
-                # Contribution to risk depends on uncertainty (wider uncertainty = wider blocking)
                 risk_accum += 1.0
 
-        # Thresholding: Risk < 0.5 means <50% chance of substantial conflict
         return (risk_accum < 0.5), risk_accum
 
 
 # =========================================================================
 # [Layer 3] Integration Agent (边缘计算代理)
 # -------------------------------------------------------------------------
-# 整合 Layer 1 (物理) 和 Layer 2 (智能)，对外提供 V2I 接口。
+# 整合 Layer 1 (物理) 和 Layer 2 (智能)，以及 Layer 3 (全息流场与时空表)。
 # =========================================================================
 
-# [新增功能 Start] 基于全息流场熵的协同机制
+# [新增结构 1] 基于全息流场熵的协同机制
 class HolographicFlowField:
     """
     [Novelty] Distributed Holographic Flow Map via Vector Stigmergy.
@@ -306,7 +287,6 @@ class HolographicFlowField:
     def inject_vector(self, mass=1.0, velocity=0.0, direction_vec=None):
         """
         Vehicle injects (Mass, Velocity) into the field.
-        direction_vec should be normalized 2D vector.
         """
         self.local_pressure += mass
         if direction_vec is not None:
@@ -315,20 +295,16 @@ class HolographicFlowField:
             self.flow_vector += momentum
 
     def step_diffusion(self, dt, neighbor_potentials: list):
-        """
-        [Algorithm] Vector Field Diffusion.
-        """
+        """[Algorithm] Vector Field Diffusion."""
         # 1. Evaporation
         self.local_pressure *= (self.decay ** dt)
         self.flow_vector *= (self.decay ** dt)
 
         # 2. Calculate Turbulence (Entropy of the Flow)
-        # Turbulence = 1.0 - (Magnitude of Mean Vector / Mean of Magnitudes)
-        # Simplified: If pressure is high but net flow is low -> High Turbulence (Jam)
         speed_mag = np.linalg.norm(self.flow_vector)
         if self.local_pressure > 0.1:
             # Order Parameter (0 to 1)
-            order = speed_mag / (self.local_pressure * 15.0 + 1e-5)  # Normalize by max speed assumption
+            order = speed_mag / (self.local_pressure * 15.0 + 1e-5)
             self.turbulence = 1.0 - np.clip(order, 0.0, 1.0)
         else:
             self.turbulence = 0.0  # Empty = Laminar
@@ -341,17 +317,18 @@ class HolographicFlowField:
         }
 
 
-# [新增功能 End]
+# [新增结构 2] 时空资源槽
+@dataclass
+class TimeSlot:
+    start_time: float
+    end_time: float
+    owner_id: str
+
 
 class EdgeSwitchAgent:
     """
     [Cyber-Physical System] Decentralized Edge Node.
-    Integrates ZD6 physics with Bayesian semantic intelligence.
-
-    Key Features:
-    1. No-ACK Semantic Communication (Fire-and-Forget).
-    2. Probabilistic Reservation Logic.
-    3. Adaptive Voltage Control based on Physical Load.
+    Integrates ZD6 physics, Bayesian semantic intelligence, Holographic Flow, and Time-Space scheduling.
     """
 
     def __init__(self, node_id, env_config):
@@ -371,181 +348,142 @@ class EdgeSwitchAgent:
 
         # --- Subsystem 2: Semantic Intelligence ---
         self.estimator = BayesianStateEstimator()
-        self.owner_id = None  # Soft ownership based on semantic agreement
+        self.owner_id = None  # Soft ownership
 
-        # [新增功能 Start] 初始化全息流场
+        # --- Subsystem 3: Holographic Flow Field ---
         self.flow_field = HolographicFlowField(node_id)
-        self.neighbor_potentials = []  # Cache of neighbor states for diffusion
-        # [新增功能 End]
+        self.neighbor_potentials = []  # Cache for diffusion
 
+        # --- Subsystem 4: Time-Space Reservation Table ---
+        self.reservations: list[TimeSlot] = []
+
+    # --- [Time-Space Logic] ---
+    def query_time_space(self, arrival_time, duration):
+        """Check if a time slot is available."""
+        req_start = arrival_time
+        req_end = arrival_time + duration
+        for slot in self.reservations:
+            if max(req_start, slot.start_time) < min(req_end, slot.end_time):
+                return True  # Conflict exists
+        return False
+
+    def reserve_time_space(self, vid, arrival_time, duration):
+        """Book a time slot."""
+        slot = TimeSlot(arrival_time, arrival_time + duration, vid)
+        self.reservations.append(slot)
+        # Cleanup old reservations
+        self.reservations = [s for s in self.reservations if s.end_time > arrival_time - 100.0]
+        return True
+
+    # --- [Interface Handlers] ---
     def handle_semantic_packet(self, packet):
-        """
-        [V2I Interface] Handles asynchronous semantic packets.
-        This method is 'Fire-and-Forget' compatible (No ACK required for protocol correctness).
-
-        Args:
-            packet: {vid, eta, duration, pos_uncertainty, direction, global_time, velocity_vec}
-        Returns:
-            dict: {status, risk, turbulence}
-        """
+        """[V2I] Async Semantic Packet Handler."""
         current_time = packet.get('global_time', 0.0)
 
-        # 1. Belief Update (Bayesian Filtering)
+        # 1. Belief Update
         self.estimator.update_belief(packet, current_time)
 
-        # [新增功能 Start] 注入全息流场 (Vector Injection)
+        # 2. Flow Field Injection
         vel = packet.get('vel', 0.0)
-        # Use velocity vector if available, or just scalar mass
-        # For simplicity in 1D/Graph logic, we use scalar mass + speed magnitude
-        self.flow_field.inject_vector(mass=1.0, velocity=vel, direction_vec=[1, 0])  # Simplified dir
-        # [新增功能 End]
+        self.flow_field.inject_vector(mass=1.0, velocity=vel, direction_vec=[1, 0])
 
-        # 2. Risk Assessment (Chance-Constrained Check)
+        # 3. Risk Assessment
         is_safe, risk = self.estimator.get_safe_window_probabilistic(
             packet['eta'], packet['duration']
         )
 
         response = {}
         if is_safe:
-            # Low Risk -> Actuate Physics
+            # Low Risk -> Actuate Physics (Soft Reservation)
             direction = packet.get('direction', 'NORMAL')
             self._set_physical_target(direction)
             self.owner_id = packet['vid']
             response = {'status': 'ACK_SEMANTIC', 'risk': risk}
         else:
-            # High Risk -> Reject (Vehicle must brake)
             response = {'status': 'RISK_HIGH', 'risk': risk}
 
-        # [新增功能 Start] 在响应中附加流场湍流度 (Turbulence)
-        # 车辆将根据此值决定是否启用“全息协同模式”
+        # Attach Flow State
         flow_state = self.flow_field.get_flow_state()
         response['turbulence'] = flow_state['turbulence']
         response['potential'] = flow_state['potential']
-        # [新增功能 End]
 
         return response
 
-    # [新增功能 Start] 用于接收邻居势能的接口（八卦协议）
+    def handle_hardware_signal(self, packet):
+        """[Hardware V2I] Direct Switch Control Signal."""
+        if packet.get('type') == 'SWITCH_REQ':
+            req = packet.get('target_state')
+            # logger.info(f"Switch {self.id} received hardware req: {req}")
+            if req == 'REVERSE':
+                self._set_physical_target('REVERSE')
+            else:
+                self._set_physical_target('NORMAL')
+
     def update_gossip(self, neighbor_p_list):
-        """[Network] Receive potentials from neighbors (Gossip)."""
+        """[Network] Update neighbor potentials for diffusion."""
         self.neighbor_potentials = neighbor_p_list
 
-    # [新增功能 End]
-
-    def get_broadcast_state(self):
-        """
-        [Digital Pheromone] Generates a compressed state packet for broadcast.
-        Used by vehicles to build their local potential field map.
-        """
-        flow = self.flow_field.get_flow_state()
-        # [修改说明] 增加 potential 和 turbulence 字段广播
-        return {
-            'id': self.id,
-            'risk_level': self.estimator.risk_level,  # Semantic Congestion
-            'pos': self.mechanism.pos,  # Physical State
-            'health': self.health_index,  # PHM State
-            'state': self.state.name,
-            'potential': flow['potential'],  # [新增]
-            'turbulence': flow['turbulence']  # [新增]
-        }
-
+    # --- [Physics & Update Loop] ---
     def _set_physical_target(self, direction):
-        """Triggers the state machine to start moving."""
         needed = self.params.stroke if direction == 'REVERSE' else 0.0
-        # Only trigger if position mismatch exists
         if abs(self.mechanism.pos - needed) > 0.005:
-            # State transition: LOCKED -> UNLOCKING
             if self.state in [SwitchState.LOCKED_NORMAL, SwitchState.LOCKED_REVERSE]:
                 self.state = SwitchState.UNLOCKING
                 self.target_pos = needed
 
     def update(self, dt, current_time):
-        """
-        [Main Loop] Executed every simulation step.
-        Couples Physics Simulation with Logic Updates.
-        """
-        # 1. Fault Handling
-        if self.state == SwitchState.STALLED:
-            return  # Failure State
+        if self.state == SwitchState.STALLED: return
 
-        # 2. Semantic Maintenance (Prune old beliefs periodically)
-        # Done implicitly in handle_semantic_packet, but can be forced here
-        # self.estimator._prune_stale_beliefs(current_time)
-
-        # 3. Adaptive Control Law (Voltage Regulation)
+        # Voltage Control (PID)
+        err = self.target_pos - self.mechanism.pos
         voltage_cmd = 0.0
-
         if self.state in [SwitchState.UNLOCKING, SwitchState.MOVING, SwitchState.LOCKING]:
-            # P-Control for position
-            err = self.target_pos - self.mechanism.pos
-
-            # Base Voltage
             u_base = 24.0
-
-            # Adaptive Boosting: If stuck in mud (High Current, Low Velocity)
+            # Adaptive Boost
             if abs(self.motor.current) > 10.0 and abs(self.mechanism.omega) < 5.0:
-                u_base = 48.0  # Boost to overcome stiction
-                # Boosting degrades health
+                u_base = 48.0
                 self.health_index -= 0.0001 * dt
-
             voltage_cmd = u_base * np.sign(err)
+            if abs(err) < 0.01: voltage_cmd *= 0.5
 
-            # Soft Landing (prevent mechanical shock)
-            if abs(err) < 0.01:
-                voltage_cmd *= 0.5
-
-        # 4. Physical Step (Coupled Simulation)
-        # External disturbance injection (Random stone jam probability)
+        # Physics Step
         ext_force = 0.0
         if np.random.random() < 0.00001 * self.mud:
-            ext_force = 5000.0  # Jamming force
+            ext_force = 5000.0
 
         torque = self.motor.step_rk4(dt, voltage_cmd, self.mechanism.omega)
         pos, vel = self.mechanism.step(dt, torque, ext_force)
 
-        # 5. State Machine Transition Logic
         self._update_fsm(pos, vel, self.motor.current, dt)
 
-        # [新增功能 Start] 更新全息流场扩散
+        # Flow Field Diffusion Step
         self.flow_field.step_diffusion(dt, self.neighbor_potentials)
-        # [新增功能 End]
 
     def _update_fsm(self, pos, vel, current, dt):
-        """Finite State Machine logic for phase transitions."""
         if self.state == SwitchState.UNLOCKING:
-            # Transition to MOVING after overcoming initial locking zone
-            if (self.target_pos > 0.1 and pos > 0.01) or \
-                    (self.target_pos < 0.1 and pos < self.params.stroke - 0.01):
+            if (self.target_pos > 0.1 and pos > 0.01) or (self.target_pos < 0.1 and pos < self.params.stroke - 0.01):
                 self.state = SwitchState.MOVING
-
         elif self.state == SwitchState.MOVING:
-            # Transition to LOCKING when near target
             dist = abs(pos - self.target_pos)
-            if dist < 0.01:
-                self.state = SwitchState.LOCKING
-
-            # Stall Detection (PHM)
+            if dist < 0.01: self.state = SwitchState.LOCKING
             if abs(current) > 20.0 and abs(vel) < 0.1:
                 self.stall_counter += dt
-                if self.stall_counter > 1.5:  # 1.5s stall limit
-                    self.state = SwitchState.STALLED
-                    logger.critical(f"Switch {self.id} STALLED due to overload!")
+                if self.stall_counter > 1.5: self.state = SwitchState.STALLED
             else:
                 self.stall_counter = 0.0
-
         elif self.state == SwitchState.LOCKING:
-            # Transition to LOCKED when fully seated
             if abs(pos - self.target_pos) < 0.001:
                 self.state = SwitchState.LOCKED_REVERSE if self.target_pos > 0.1 else SwitchState.LOCKED_NORMAL
 
-    def get_telemetry(self):
-        """Full system telemetry for analytics."""
+    def get_broadcast_state(self):
+        """Generate telemetry packet."""
+        flow = self.flow_field.get_flow_state()
         return {
             'id': self.id,
             'state': self.state.name,
-            'risk': self.estimator.risk_level,  # Semantic metric
-            'pos': self.mechanism.pos,  # Physical metric
-            'current': self.motor.current,  # Electrical metric
-            'temp': self.motor.temperature,  # Thermal metric
-            'health': self.health_index
+            'pos': self.mechanism.pos,
+            'health': self.health_index,
+            'risk_level': self.estimator.risk_level,
+            'potential': flow['potential'],
+            'turbulence': flow['turbulence']
         }
