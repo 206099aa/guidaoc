@@ -69,7 +69,9 @@ class VehicleAgent:
         self.env = env_config
         self.map = map_graph
         self.infra = infra_agents
-        self.all_vehicles = []  # Global reference for V2V simulation
+        self.all_vehicles = []
+        self.stall_event_count = 0# Global reference for V2V simulation
+        self.overload_timer = 0.0
 
         # --- 1. Physics Engine Integration ---
         self.physics = RailVehicleMBDSystem(self.cfg, self.env)
@@ -239,7 +241,25 @@ class VehicleAgent:
             self.time_active += dt
 
         self.vibration_level = abs(self.current_speed) * 0.5 * np.random.normal(1, 0.1)
+        # [新增] 物理性堵转检测逻辑
+        # 判定条件：电流超过 95% 且 速度接近 0 (陷入泥潭)
+        current_abs = abs(dynamics['motor_current'])
+        vel_abs = abs(dynamics['loco_vel'])
+        max_current = 500.0  # 假设最大电流
 
+        if current_abs > max_current * 0.95 and vel_abs < 0.05:
+            self.overload_timer += dt
+        else:
+            self.overload_timer = 0.0
+
+        # 持续过载超过 2秒 -> 判定为一次 Stall 事件
+        if self.overload_timer > 2.0:
+            self.stall_event_count += 1
+            logger.warning(f"Vehicle {self.id} STALLED due to mud! (Current: {current_abs:.1f}A)")
+            self.state = VehicleState.FAULT_RECOVERY  # 强制进入恢复模式
+            self.recovery_timer = 10.0  # 冷却时间
+            self.overload_timer = 0.0  # 重置
+            
         # 遥测打包
         self.last_telemetry = {
             'id': self.id, 'state': self.state.name, 'mode': self.mode.name,
@@ -248,7 +268,8 @@ class VehicleAgent:
             'mu': dynamics.get('mu_effective', 0.0),
             'energy': self.energy.total_energy, 'mass_total': self.physics.mass_total,
             'z': self.pos_3d[2], 'vib': self.vibration_level,
-            'potential': 0.0
+            'potential': 0.0,
+            'rssi': self.current_rssi  # [Fix] Added RSSI field
         }
         return self.last_telemetry
 
@@ -263,12 +284,16 @@ class VehicleAgent:
         """
         self.v2v_neighbors = []
         scan_radius = 200.0  # DSRC typical range
-        max_rssi = -120.0 + np.random.normal(0, 1.0)
+
+        # 1. 寻找最近的信号源（车或基站）来计算 RSSI
+        min_dist = float('inf')
 
         for v in self.all_vehicles:
             if v.id == self.id: continue
 
             dist = np.linalg.norm(self.pos_2d - v.pos_2d)
+            if dist < min_dist: min_dist = dist
+
             if dist < scan_radius:
                 # 剔除严重故障车辆 (不可信节点)
                 if v.health_status < 0.3: continue
@@ -277,8 +302,23 @@ class VehicleAgent:
         # 同时读取路侧单元 (RFID/Balise) 缓存势能
         curr_infra = self.infra.get(self.current_node_id)
         if curr_infra:
+            # 假设基站距离为 5.0 (模拟近距离)
+            dist_infra = 5.0
+            if dist_infra < min_dist: min_dist = dist_infra
+
             state = curr_infra.get_broadcast_state()
             self.cached_node_potential[self.current_node_id] = (state.get('potential', 0.0), now)
+
+        # 2. 更新 RSSI (简单的对数路径损耗模型)
+        if min_dist == float('inf'):
+            target_rssi = -120.0  # 无信号底噪
+        else:
+            # 模拟：发射功率 20dBm, 路径损耗指数 3.0, 参考损耗 40dB
+            path_loss = 10 * 3.0 * np.log10(max(1.0, min_dist))
+            target_rssi = 20.0 - path_loss - 40.0
+
+        # 添加随机噪声
+        self.current_rssi = target_rssi + np.random.normal(0, 2.0)
 
     def _perform_rail_topology_scan(self):
         """

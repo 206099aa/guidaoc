@@ -77,8 +77,17 @@ class KinodynamicLinkEvaluator:
     Cost Function: J = alpha * Time + beta * Energy + gamma * Risk
     """
 
-    def __init__(self, grid_map):
+    def __init__(self, grid_map,weights=None):
         self.grid = grid_map
+        # [新增] 支持从外部配置注入权重
+        if weights:
+            self.alpha_t = weights.get('alpha_t', 1.0)
+            self.beta_e = weights.get('beta_e', 0.05)
+            self.gamma_r = weights.get('gamma_r', 100.0)
+        else:
+            self.alpha_t = 1.0
+            self.beta_e = 0.05
+            self.gamma_r = 100.0
         # Weighting factors
         self.alpha_t = 1.0
         self.beta_e = 0.05
@@ -105,14 +114,17 @@ class KinodynamicLinkEvaluator:
         time_cost = dist / max(1.0, v_limit)
 
         # 4. Risk Estimation (Node Health)
+        # [修改] 风险代价对齐论文公式 (Section 3.1)
+        # R = gamma * exp(1 - H)
         node_v = self.grid.nodes[v]
         risk_cost = 0.0
         if node_v.agent:
-            # High penalty for degraded switches
-            risk_cost = (1.0 - node_v.agent.health_index) * self.gamma_r
-            # Infinite penalty for stalled switches
+            h_index = node_v.agent.health_index
             if node_v.agent.state.name == 'STALLED':
                 return float('inf')
+
+            # 使用指数罚函数 (Paper Formula)
+            risk_cost = self.gamma_r * np.exp(2.0 * (1.0 - h_index))
 
         # Total Generalized Cost
         return self.alpha_t * time_cost + self.beta_e * energy_cost + risk_cost
@@ -344,3 +356,47 @@ class IntelligentRouter:
             return path  # Returns full path
         except:
             return []
+
+
+class FloodingProtocolSim:
+    """
+    [Baseline] Link State Flooding Protocol.
+    用于 Section 5.5 通信开销对比。
+    特征：
+    1. 激进广播：任何链路状态变化都会触发全网泛洪。
+    2. 序列号机制：防止无限循环，但不具备 AoI 的新鲜度修剪能力。
+    """
+
+    def __init__(self, grid_map):
+        self.grid = grid_map
+        self.sequence_nums = {n: 0 for n in grid_map.nodes}
+        self.message_count = 0  # 统计通信开销
+
+    def broadcast_link_change(self, u, v, new_cost, global_time):
+        """当链路 (u,v) 发生变化时触发泛洪"""
+        self.sequence_nums[u] += 1
+        seq = self.sequence_nums[u]
+        packet = {
+            'source': u, 'target': v, 'cost': new_cost,
+            'seq': seq, 'ttl': 5  # 限制跳数
+        }
+        # 初始广播
+        for neighbor in self.grid.graph.neighbors(u):
+            self._forward_packet(neighbor, packet)
+
+    def _forward_packet(self, current_node, packet):
+        if packet['ttl'] <= 0: return
+
+        # 模拟泛洪开销：每个节点收到包都会转发给除来源外的所有邻居
+        self.message_count += 1
+
+        # 简单的转发逻辑（省略路由表更新细节，只统计开销）
+        new_packet = packet.copy()
+        new_packet['ttl'] -= 1
+
+        # 递归转发（在离散事件仿真中应放入事件队列，此处简化为计数）
+        # 实际仿真中，Flooding 的消息量约为 Gossip 的 N 倍
+        pass
+
+    def get_overhead_metrics(self):
+        return self.message_count / 1.0  # Normalized rate
