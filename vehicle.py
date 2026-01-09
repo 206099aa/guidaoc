@@ -109,6 +109,7 @@ class VehicleAgent:
         self.v2v_neighbors = []  # All vehicles in comms range (Raw Hardware Data)
         self.rail_obstacles = []  # Vehicles physically blocking my track (Topology Logic)
         self.cached_node_potential = {}
+        self.current_rssi = -120.0  # 默认底噪
 
         # --- 5. Control Internal State ---
         self.mpc_prev_u = 0.0
@@ -262,6 +263,7 @@ class VehicleAgent:
         """
         self.v2v_neighbors = []
         scan_radius = 200.0  # DSRC typical range
+        max_rssi = -120.0 + np.random.normal(0, 1.0)
 
         for v in self.all_vehicles:
             if v.id == self.id: continue
