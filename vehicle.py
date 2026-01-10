@@ -690,7 +690,9 @@ class VehicleAgent:
     def _sync_kinematics(self, dt):
         tid = self.next_node_id if self.next_node_id else (self.path_queue[0] if self.path_queue else None)
         if tid:
-            t_pos = np.array(self.map.nodes[tid].pos)
+            # [修复] 强制指定 dtype=float，防止读取整数坐标导致 self.pos_2d 变成 int 类型
+            t_pos = np.array(self.map.nodes[tid].pos, dtype=float)
+
             vec = t_pos - self.pos_2d
             dist = np.linalg.norm(vec)
             if dist > 1e-4:
