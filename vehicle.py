@@ -1,324 +1,756 @@
 import numpy as np
-import math
 import logging
 import random
+import math
+import networkx as nx
 from enum import Enum, auto
 from collections import deque
 from dataclasses import dataclass
 
-# --- 引入底层物理内核 ---
+# 引入高保真物理内核
 from physics import RailVehicleMBDSystem
 
 # 配置日志
-logger = logging.getLogger("DeepVehicleAgent")
+logger = logging.getLogger("Edge.Vehicle")
+
+
+# =========================================================================
+# [Layer 1] State & Mode Definitions
+# =========================================================================
+
+class ControlMode(Enum):
+    """
+    [Control Mode]
+    PERFORMANCE:  High-speed, centralized time-space optimization (4D Planning).
+    ROBUST:       Conservative speed, potential field navigation (Weak Net).
+    HARDWARE_V2X: Distributed dynamic game theory (No Net / Ad-hoc).
+    EMERGENCY:    Mechanical fallback / Safety stop.
+    """
+    PERFORMANCE = auto()
+    ROBUST = auto()
+    HARDWARE_V2X = auto()
+    EMERGENCY = auto()
 
 
 class VehicleState(Enum):
     """
-    [FSM] Finite State Machine for Autonomous Edge Agent.
+    [FSM] Lifecycle states.
     """
-    IDLE = auto()  # 休眠/待命
-    PLANNING = auto()  # 路径规划中
-    NEGOTIATING = auto()  # 边缘协同中 (V2I Handshake)
-    TRACTION_CONTROL = auto()  # 正常行驶 (SMC Control)
-    COASTING = auto()  # 惰行节能
-    BRAKING_NORMAL = auto()  # 进站制动
-    BRAKING_EMERGENCY = auto()  # ATP 触发紧急制动
-    FAULT_RECOVERY = auto()  # 故障降级模式
-    ARRIVED = auto()  # [Fix] 新增到达状态
+    IDLE = auto()
+    SEARCHING = auto()
+    LOADING = auto()
+    RETURNING = auto()
+    UNLOADING = auto()
+    FAULT_RECOVERY = auto()  # 故障自愈
+    TRACTION_CONTROL = auto()  # 牵引控制
+    BRAKING_NORMAL = auto()  # 常规制动
+    WAITING_SWITCH = auto()  # 等待道岔
 
 
 @dataclass
 class EnergyAudit:
-    """[Energy Model] Fine-grained energy consumption tracking."""
-    traction_joules: float = 0.0  # 电机做功
-    compute_joules: float = 0.0  # 边缘计算功耗
-    comm_joules: float = 0.0  # 通信射频功耗
+    traction_joules: float = 0.0
+    compute_joules: float = 0.0
+    comm_joules: float = 0.0
 
     @property
-    def total(self): return self.traction_joules + self.compute_joules + self.comm_joules
+    def total_energy(self):
+        return self.traction_joules + self.compute_joules + self.comm_joules
 
 
-class SlidingModeController:
-    """
-    [Control Algo] Robust Sliding Mode Controller (SMC).
-    Designed to handle high uncertainty in mud friction.
-    Control Law: u = u_eq + u_sw
-    """
-
-    def __init__(self, mass, max_voltage, k_gain=15.0, lambda_s=0.5):
-        self.mass = mass
-        self.max_voltage = max_voltage
-        self.K = k_gain  # 鲁棒增益 (应对扰动上限)
-        self.lam = lambda_s  # 滑模面收敛率
-        # [CRITICAL FIX] 极大增大边界层厚度，抑制抖振 (Chattering)
-        self.phi = 15.0
-        self.integral_e = 0.0
-        # [NEW] 用于输出滤波
-        self.prev_u = 0.0
-
-    def compute(self, target_v, current_v, dt, estimated_resistance):
-        """
-        计算电机电压指令
-        """
-        # 1. 定义误差与滑模面
-        e = target_v - current_v
-        self.integral_e += e * dt
-        # 抗积分饱和
-        self.integral_e = np.clip(self.integral_e, -10.0, 10.0)
-
-        s = e + self.lam * self.integral_e
-
-        # 2. 等效控制 (Equivalent Control)
-        # 前馈补偿
-        u_eq = estimated_resistance * 0.2
-
-        # 3. 切换控制 (Switching Control)
-        # [Fix] 使用饱和函数 (sat) 代替符号函数 (sign)
-        # s/phi 在 [-1, 1] 之间是线性的，超过则是饱和的
-        sat_s = np.clip(s / self.phi, -1.0, 1.0)
-        u_sw = self.K * sat_s
-
-        # 4. 总输出与饱和
-        u_total = u_eq + u_sw
-        u_clamped = np.clip(u_total, -self.max_voltage, self.max_voltage)
-
-        # [CRITICAL FIX] 输出低通滤波 (LPF)
-        # 模拟真实执行器的延迟，禁止电压瞬变
-        alpha = 0.1  # 新值权重
-        u_smooth = (1.0 - alpha) * self.prev_u + alpha * u_clamped
-        self.prev_u = u_smooth
-
-        return u_smooth, s
-
+# =========================================================================
+# [Layer 2] Cyber-Physical Agent Implementation
+# =========================================================================
 
 class VehicleAgent:
-    """
-    [Edge AI Agent]
-    Autonomous Rail Vehicle for Paddy Fields.
-    Features:
-    - V2I Distributed Locking (Wound-Wait).
-    - On-board Safety Layer (ATP).
-    - High-Fidelity Physics Integration.
-    - [NEW] SCI-Grade Energy Auditing (SEC, Power Analysis)
-    """
-
-    def __init__(self,
-                 agent_id: str,
-                 vehicle_type_cfg: dict,
-                 env_config: dict,
-                 start_node: str,
-                 map_graph,
-                 infra_agents: dict):  # {node_id: EdgeSwitchAgent}
-
+    def __init__(self, agent_id, vehicle_type_cfg, env_config, start_node, map_graph, infra_agents):
         self.id = agent_id
         self.cfg = vehicle_type_cfg
-
-        # [SCI Requirement] Ensure critical attributes exist
-        self.cfg.setdefault('mass_full', 12000.0)
-        self.cfg.setdefault('length', 8.5)
-        self.cfg.setdefault('max_speed', 15.0)
-
         self.env = env_config
         self.map = map_graph
-        self.infra = infra_agents  # 感知范围内的基础设施
+        self.infra = infra_agents
+        self.all_vehicles = []
+        self.stall_event_count = 0# Global reference for V2V simulation
+        self.overload_timer = 0.0
 
-        # --- 1. 物理内核实例化 ---
-        self.physics = RailVehicleMBDSystem(
-            vehicle_config=self.cfg,
-            env_config=self.env
-        )
+        # --- 1. Physics Engine Integration ---
+        self.physics = RailVehicleMBDSystem(self.cfg, self.env)
+        self.length = float(self.cfg.get('length', 12.0))
+        self.physics.length = self.length
 
-        # 初始位置设定
+        # --- 2. Kinematics (2D & 3D) ---
         if start_node in self.map.nodes:
             self.pos_2d = np.array(self.map.nodes[start_node].pos, dtype=float)
             self.physics._init_position(spacing=2.0)
         else:
             self.pos_2d = np.array([0.0, 0.0])
 
-        # --- 2. 边缘智能核心 ---
-        self.timestamp = 0.0 + random.random()
+        self.pos_3d = np.array([self.pos_2d[0], self.pos_2d[1], 0.0])
+        self.orientation = np.array([0.0, 0.0, 0.0])
+        self.health_status = 1.0
+        self.vibration_level = 0.0
+        self.recovery_timer = 0.0
+
+        # --- 3. Cognitive State & Navigation ---
         self.state = VehicleState.IDLE
+        self.mode = ControlMode.HARDWARE_V2X  # Default to decentralized
+        self.home_node = start_node
+        self.target_node = self._hash_food_target()
+
+        self.current_node_id = start_node
+        self.next_node_id = None
         self.path_queue = deque()
-        self.current_lock = None
+        self.switch_triggered = False  # Interlocking flag
 
-        # --- 3. 控制与安全 ---
-        # [Adjust] 降低控制器增益，避免过激
-        self.controller = SlidingModeController(
-            mass=self.cfg['mass_full'],
-            max_voltage=48.0,
-            k_gain=8.0
-        )
+        # --- 4. Perception & Networking ---
+        self.network_uncertainty = 0.0
+        self.last_broadcast_pos = self.pos_2d.copy()
+        self.last_broadcast_ts = -100.0
+
+        # V2X Lists
+        self.v2v_neighbors = []  # All vehicles in comms range (Raw Hardware Data)
+        self.rail_obstacles = []  # Vehicles physically blocking my track (Topology Logic)
+        self.cached_node_potential = {}
+        self.current_rssi = -120.0  # 默认底噪
+
+        # --- 5. Control Internal State ---
+        self.mpc_prev_u = 0.0
+        self.game_weight = 0.0  # Priority weight for dynamic game
+
+        # --- 6. Telemetry ---
         self.energy = EnergyAudit()
-
-        # ATP 安全参数
-        self.safe_braking_decel = 0.5  # m/s^2 (泥地保守值)
-        self.comm_range = 500.0  # V2I 通信距离
-
-        # --- 4. [NEW] SCI Telemetry Accumulators ---
+        self.current_speed = 0.0
         self.dist_accumulated = 0.0
         self.time_active = 0.0
+        self.wait_timer = 0.0
         self.last_telemetry = {}
 
     def step(self, dt, global_time):
         """
-        [Real-time Loop] 10Hz - 50Hz Control Loop.
-        Perception -> Negotiation -> Planning -> Control -> Actuation.
+        [Main Loop] Frequency: 1/dt Hz
+        Phase 1: Perception & Assessment
+        Phase 2: Planning (Time-Space or Game Theory)
+        Phase 3: Control & Actuation
         """
-        # 1. 状态感知 (Perception)
-        real_v = self.physics.state[1]
-        sensor_v = real_v + np.random.normal(0, 0.02)  # 降低观测噪声
+        # -----------------------------------------------------------------
+        # 1. Perception Layer
+        # -----------------------------------------------------------------
+        # A. 硬件扫描 (模拟雷达/DSRC 物理接收)
+        self._perform_hardware_v2x_scan(global_time)
 
-        # 2. 边缘计算功耗
-        self.energy.compute_joules += 2.0 * dt
+        # B. 轨道拓扑过滤 (从硬件邻居中筛选出轨道上的障碍)
+        self._perform_rail_topology_scan()
 
-        # --- 状态机逻辑 ---
+        # C. 网络环境评估
+        self._assess_network_condition(global_time)
+
+        # -----------------------------------------------------------------
+        # 2. Planning Layer (Decision Making)
+        # -----------------------------------------------------------------
+        # 随机故障注入 (Reliability Testing)
+        if self.state != VehicleState.FAULT_RECOVERY and np.random.random() < 0.00001:
+            logger.warning(f"Vehicle {self.id} experienced POWERTRAIN_FAULT!")
+            self.state = VehicleState.FAULT_RECOVERY
+            self.recovery_timer = 5.0
+
+        # 获取基于物理环境的动态限速 (EAVP)
+        v_limit_ref = self._get_speed_limit()
+
+        # 任务逻辑流转
+        self._update_mission_logic(dt)
+
+        # -----------------------------------------------------------------
+        # 3. Control Layer (Execution)
+        # -----------------------------------------------------------------
         u_cmd = 0.0
 
-        if self.state == VehicleState.IDLE:
-            if global_time > 1.0 and not self.path_queue:
-                self._plan_mission()
-                self.state = VehicleState.NEGOTIATING
+        # === Case A: Fault Recovery ===
+        if self.state == VehicleState.FAULT_RECOVERY:
+            u_cmd = 0.0
+            self.recovery_timer -= dt
+            if self.recovery_timer <= 0:
+                logger.info(f"Vehicle {self.id} recovered from fault.")
+                self.state = VehicleState.SEARCHING
+                self.health_status = 0.9
 
-        elif self.state == VehicleState.NEGOTIATING:
-            self.energy.compute_joules += 5.0 * dt
-            if not self.path_queue:
-                self.state = VehicleState.IDLE
-            else:
-                target_node = self.path_queue[0]
-                if self._v2i_handshake(target_node, global_time):
-                    logger.info(f"[{self.id}] Edge Lock Acquired: {target_node}")
-                    self.state = VehicleState.TRACTION_CONTROL
+        # === Case B: Moving State ===
+        elif self.state in [VehicleState.SEARCHING, VehicleState.RETURNING, VehicleState.TRACTION_CONTROL]:
+            # Step 1: 路径规划 (Path Planning)
+            # 如果没有路径，根据网络模式选择规划策略
+            if not self.path_queue and not self.next_node_id:
+                if self.mode == ControlMode.PERFORMANCE:
+                    # 有网: 时空 A* 规划 (4D Trajectory)
+                    self._plan_spacetime_optimal(global_time)
                 else:
-                    u_cmd = 0.0
+                    # 无网: 静态拓扑规划 (离线地图兜底)
+                    self._plan_local_path_static()
 
-        elif self.state == VehicleState.TRACTION_CONTROL:
-            if not self.path_queue:
-                self.state = VehicleState.BRAKING_NORMAL
-            else:
-                dist_to_target = self._dist_to(self.path_queue[0])
+            # 填充下一跳
+            if self.path_queue and not self.next_node_id:
+                self.next_node_id = self.path_queue[0]
 
-                # [Fix] 更柔和的速度规划
-                target_v = self.cfg['max_speed']
-                if dist_to_target < 20.0: target_v = 3.0  # 提前减速
+            # Step 2: 速度协商 (Speed Negotiation)
+            target_v = v_limit_ref
 
-                if dist_to_target < 2.0:
-                    self.state = VehicleState.BRAKING_NORMAL
-                else:
-                    est_resist = 200.0 + 50.0 * sensor_v
-                    u_cmd, _ = self.controller.compute(target_v, sensor_v, dt, est_resist)
+            if self.mode == ControlMode.HARDWARE_V2X:
+                # 无网: 分布式动态博弈 (V2V Negotiation)
+                target_v = self._negotiate_v2v_game(v_limit_ref)
+            elif self.mode == ControlMode.PERFORMANCE:
+                # 有网: 动态冲突响应 (Dynamic Conflict Response)
+                target_v = self._handle_dynamic_conflict(v_limit_ref)
 
+            # Step 3: 道岔与运动控制 (Switch & Motion)
+            if self.next_node_id:
+                # 触发道岔动作 (Interlocking)
+                self._handle_switch_control(global_time)
+
+                # 执行 MPC 鲁棒追踪
+                u_cmd = self._mpc_control(dt, target_v)
+
+        # === Case C: Waiting for Switch ===
+        elif self.state == VehicleState.WAITING_SWITCH:
+            u_cmd = self._mpc_control(dt, 0.0)  # 保持停车
+            if self._check_switch_status():
+                self.state = VehicleState.SEARCHING  # 道岔到位，恢复行驶
+
+        # === Case D: Normal Braking ===
         elif self.state == VehicleState.BRAKING_NORMAL:
-            if not self.path_queue:
-                u_cmd = 0.0
-                self.state = VehicleState.IDLE
+            if abs(self.current_speed) > 0.1:
+                u_cmd = -48.0 if self.current_speed > 0 else 48.0
             else:
-                dist = self._dist_to(self.path_queue[0])
-                # [Fix] 判定到达逻辑
-                if dist < 0.5 and abs(sensor_v) < 0.2:
-                    self.path_queue.popleft()
-                    if not self.path_queue:
-                        self.state = VehicleState.IDLE
-                        u_cmd = 0.0
-                    else:
-                        self.state = VehicleState.TRACTION_CONTROL
-                else:
-                    # 柔和制动
-                    u_cmd = -24.0 if sensor_v > 0 else 24.0
+                u_cmd = 0.0
 
-        # --- 3. 物理执行 (Actuation) ---
+        # -----------------------------------------------------------------
+        # 4. Actuation & Feedback Layer
+        # -----------------------------------------------------------------
+        # 物理引擎解算
         dynamics = self.physics.step_rk4(dt, u_cmd)
+        self.current_speed = dynamics['loco_vel']
 
-        # --- 4. 能耗审计与上报 [SCI Upgrade] ---
-        # 瞬时功率 P_inst = U * I
-        p_inst = abs(u_cmd * dynamics['motor_current'])  # Watts
+        # 状态同步
+        self._sync_kinematics(dt)
+        self._update_kinematics_3d(dt)
+
+        # 通信与能耗
+        self._try_broadcast_semantic(global_time)
+
+        p_inst = abs(u_cmd * dynamics['motor_current'])
         self.energy.traction_joules += p_inst * dt
-
-        # 运动学更新
-        v_mps = dynamics['loco_vel']
-
-        # [CRITICAL FIX] 修复位置更新漂移问题
-        # 使用积分后的实际位移，仅在速度大于死区时更新
-        if abs(v_mps) > 1e-4:
-            dist_step = v_mps * dt
+        if abs(self.current_speed) > 0.01:
+            self.dist_accumulated += abs(self.current_speed * dt)
             self.time_active += dt
-            self.dist_accumulated += abs(dist_step)
-            self._update_kinematics(dist_step)
 
-        # 5. 打包全量遥测数据
-        self.last_telemetry = {
-            'id': self.id,
-            'state': self.state.name,
-            'pos': self.pos_2d,
-            'vel': v_mps,
-            'force': dynamics['coupler_force_1'],
-            'current': dynamics['motor_current'],
-            'rssi': -65.0,
-            'energy_total': self.energy.total,
-            'mud': self.env['mud_factor'],
-            'p_inst': p_inst,
-            'mu': dynamics['mu_effective'],
-            'mass': dynamics['mass_total'],
-            'length': dynamics['length'],
-            'dist_accum': self.dist_accumulated,
-            'time_active': self.time_active
-        }
-        return self.last_telemetry
+        self.vibration_level = abs(self.current_speed) * 0.5 * np.random.normal(1, 0.1)
+        # [新增] 物理性堵转检测逻辑
+        # 判定条件：电流超过 95% 且 速度接近 0 (陷入泥潭)
+        current_abs = abs(dynamics['motor_current'])
+        vel_abs = abs(dynamics['loco_vel'])
+        max_current = 500.0  # 假设最大电流
 
-    def _v2i_handshake(self, target_node_id, global_time):
-        target_infra = self.infra.get(target_node_id)
-        if not target_infra: return True
-
-        if target_node_id in self.map.nodes:
-            target_pos_2d = np.array(self.map.nodes[target_node_id].pos)
-            dist = np.linalg.norm(self.pos_2d - target_pos_2d)
+        if current_abs > max_current * 0.95 and vel_abs < 0.05:
+            self.overload_timer += dt
         else:
-            dist = 100.0
+            self.overload_timer = 0.0
 
-        tx_power = 0.001 * (1 + (dist / 100.0) ** 2)
-        self.energy.comm_joules += tx_power * 0.05
+        # 持续过载超过 2秒 -> 判定为一次 Stall 事件
+        if self.overload_timer > 2.0:
+            self.stall_event_count += 1
+            logger.warning(f"Vehicle {self.id} STALLED due to mud! (Current: {current_abs:.1f}A)")
+            self.state = VehicleState.FAULT_RECOVERY  # 强制进入恢复模式
+            self.recovery_timer = 10.0  # 冷却时间
+            self.overload_timer = 0.0  # 重置
 
-        success_pack = target_infra.handle_access_request({
-            'vid': self.id, 'timestamp': self.timestamp, 'priority': 10,
-            'duration': 20.0, 'global_time': global_time, 'action': 'LOCK', 'direction': 'NORMAL'
-        })
+            # 遥测打包
+            self.last_telemetry = {
+                'id': self.id,
+                'type': self.cfg.get('type_name', 'Unknown'),  # 方便分析是谁
+                'state': self.state.name,
+                'mode': self.mode.name,
+                # 'pos': self.pos_2d, # 删掉这个难读的数组
+                'pos_x': self.pos_2d[0],  # 拆开写
+                'pos_y': self.pos_2d[1],
+                'distance': self.dist_accumulated,  # <--- 【关键】必须把里程表导出来！
+                'vel': self.current_speed,
+                'force': dynamics['coupler_force_1'],
+                'current': dynamics['motor_current'],
+                'mu': dynamics.get('mu_effective', 0.0),
+                'energy': self.energy.total_energy,
+                'mass_total': self.physics.mass_total,  # 这样我们能确认重量对不对
+                'z': self.pos_3d[2],
+                'vib': self.vibration_level,
+                'rssi': self.current_rssi
+            }
+            return self.last_telemetry
 
-        status = success_pack.get('status', 'FAIL')
-        if status in ['GRANTED', 'GRANTED_PREEMPT']:
-            self.current_lock = target_node_id
-            return True
+    # =========================================================================
+    # [Module 1] Perception: Hardware V2X & Rail Topology
+    # =========================================================================
+
+    def _perform_hardware_v2x_scan(self, now):
+        """
+        [Hardware Layer] Simulate DSRC/C-V2X radio receiving beacons.
+        Populates self.v2v_neighbors with all 'audible' vehicles within range.
+        """
+        self.v2v_neighbors = []
+        scan_radius = 200.0  # DSRC typical range
+
+        # 1. 寻找最近的信号源（车或基站）来计算 RSSI
+        min_dist = float('inf')
+
+        for v in self.all_vehicles:
+            if v.id == self.id: continue
+
+            dist = np.linalg.norm(self.pos_2d - v.pos_2d)
+            if dist < min_dist: min_dist = dist
+
+            if dist < scan_radius:
+                # 剔除严重故障车辆 (不可信节点)
+                if v.health_status < 0.3: continue
+                self.v2v_neighbors.append((dist, v))
+
+        # 同时读取路侧单元 (RFID/Balise) 缓存势能
+        curr_infra = self.infra.get(self.current_node_id)
+        if curr_infra:
+            # 假设基站距离为 5.0 (模拟近距离)
+            dist_infra = 5.0
+            if dist_infra < min_dist: min_dist = dist_infra
+
+            state = curr_infra.get_broadcast_state()
+            self.cached_node_potential[self.current_node_id] = (state.get('potential', 0.0), now)
+
+        # 2. 更新 RSSI (简单的对数路径损耗模型)
+        if min_dist == float('inf'):
+            target_rssi = -120.0  # 无信号底噪
         else:
-            return False
+            # 模拟：发射功率 20dBm, 路径损耗指数 3.0, 参考损耗 40dB
+            path_loss = 10 * 3.0 * np.log10(max(1.0, min_dist))
+            target_rssi = 20.0 - path_loss - 40.0
 
-    def _plan_mission(self):
-        if "Hauler" in self.id:
-            self.path_queue = deque(["N_0_0", "N_0_1", "Stop_H_0_1"])
+        # 添加随机噪声
+        self.current_rssi = target_rssi + np.random.normal(0, 2.0)
+
+    def _perform_rail_topology_scan(self):
+        """
+        [Topology Layer] Filter neighbors to find those actually blocking my rail path.
+        Replaces simple radius scan with logic-based obstacle detection.
+        """
+        self.rail_obstacles = []
+        if not self.next_node_id: return
+
+        my_pos = self.pos_2d
+        target_pos = np.array(self.map.nodes[self.next_node_id].pos)
+
+        # 计算当前轨道段的方向矢量
+        path_vec = target_pos - my_pos
+        path_len = np.linalg.norm(path_vec)
+        if path_len < 0.1: return
+        path_dir = path_vec / path_len
+
+        for dist, v in self.v2v_neighbors:
+            rel_vec = v.pos_2d - my_pos
+
+            # 1. 投影检查：是否在前方？
+            proj = np.dot(rel_vec, path_dir)
+            if proj > 0 and proj < path_len + 10.0:
+                # 2. 垂直距离检查：是否在轨道宽度内？
+                perp_dist = np.linalg.norm(rel_vec - proj * path_dir)
+                if perp_dist < 2.5:  # 轨道走廊宽度
+                    self.rail_obstacles.append((dist, v))
+
+    # =========================================================================
+    # [Module 2] Planning: Time-Space & Static
+    # =========================================================================
+
+    def _plan_spacetime_optimal(self, start_time):
+        """
+        [Advanced] Time-Space A* Planning.
+        Finds a path minimizing cost in (Node, Time) space to avoid conflicts.
+        """
+        try:
+            # 简化的 TS-A* 实现
+            # 实际部署应查询 infrastructure.query_time_space
+            path = nx.shortest_path(self.map.graph, self.current_node_id, self.target_node)
+
+            # 尝试预约沿途资源
+            curr_t = start_time
+            valid_path = True
+
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                edge_len = 300.0  # Approximate
+                duration = edge_len / 10.0  # Est speed 10m/s
+
+                infra = self.infra.get(v)
+                if infra:
+                    # [关键修复] 如果时间窗冲突，尝试推迟进入时间 (Wait logic)
+                    wait_time = 0.0
+                    max_wait = 60.0
+
+                    # 循环检测：直到找到空闲窗口
+                    while infra.query_time_space(curr_t + wait_time, duration):
+                        wait_time += 2.0  # 每次推迟2秒
+                        if wait_time > max_wait:
+                            break  # 超时，只能硬着头皮上了(依靠MPC避障)
+
+                    final_start_t = curr_t + wait_time
+                    infra.reserve_time_space(self.id, final_start_t, duration)
+
+                    # 更新当前规划时间
+                    curr_t = final_start_t + duration
+                else:
+                    curr_t += duration  # 无基站，直接累加时间
+
+            if path and path[0] == self.current_node_id: path.pop(0)
+            self.path_queue = deque(path)
+            logger.info(f"[{self.id}] TS-A* Path Planned: {len(path)} hops")
+
+        except Exception as e:
+            logger.warning(f"TS-A* Failed: {e}, fallback to static.")
+            self._plan_local_path_static()
+
+    def _plan_local_path_static(self):
+        """[Fallback] Static Dijkstra/BFS Planning."""
+        try:
+            path = nx.shortest_path(self.map.graph, self.current_node_id, self.target_node)
+            if path and path[0] == self.current_node_id: path.pop(0)
+            self.path_queue = deque(path)
+        except:
+            self.path_queue = deque()
+
+    # =========================================================================
+    # [Module 3] Decision: Dynamic Game & Conflict Handling
+    # =========================================================================
+
+    def _negotiate_v2v_game(self, desired_v):
+        """
+        [No-Net Innovation] Distributed Dynamic Game for Right-of-Way.
+        Calculates priority weight and negotiates speed with neighbors.
+        """
+        if not self.next_node_id: return desired_v
+
+        # 1. 计算自身博弈权重 (Weight Function)
+        # W = alpha*Speed + beta*Mass + gamma/Distance
+        dist_to_next = self._dist_to(self.next_node_id)
+        mass = self.physics.mass_total
+        self.game_weight = 0.5 * abs(self.current_speed) + 0.001 * mass + 100.0 / (dist_to_next + 1.0)
+
+        safe_v = desired_v
+
+        # 2. 与邻居博弈
+        for d, neighbor in self.v2v_neighbors:
+            # 仅与争夺同一目标节点的邻居博弈
+            if neighbor.next_node_id == self.next_node_id:
+                # 获取对方权重 (模拟 V2V 数据包解析)
+                n_weight = getattr(neighbor, 'game_weight', 0.0)
+
+                if n_weight > self.game_weight:
+                    # 我输了 (Yield)
+                    # 计算精确减速曲线，在路口前 safety_gap 处将速度降至微速
+                    gap = 20.0
+                    if dist_to_next > gap:
+                        # 平滑减速，保持流动性 (Rolling Stop)
+                        safe_v = min(safe_v, 2.0)  # 降级为蠕行
+                    else:
+                        safe_v = 0.0  # 必须停车让行
+
+        return safe_v
+
+    def _handle_dynamic_conflict(self, v_ref):
+        """
+        [Networked] React to dynamic uncertainties (e.g., front car slowing down).
+        """
+        # 检查轨道前车距离
+        if self.rail_obstacles:
+            nearest_d, nearest_v = min(self.rail_obstacles, key=lambda x: x[0])
+
+            # ACC 跟驰逻辑
+            safe_gap = 25.0
+            if nearest_d < safe_gap * 2:
+                # P-Control maintain gap
+                err = nearest_d - safe_gap
+                target_v = max(0.0, nearest_v.current_speed + 0.5 * err)
+                return min(v_ref, target_v)
+
+        return v_ref
+
+    # =========================================================================
+    # [Module 4] Control: MPC & Switching
+    # =========================================================================
+
+    def _mpc_control(self, dt, v_limit_ref):
+        """
+        [Control Core] Physics-Aware Explicit MPC.
+        Minimizes J = (v - v_ref)^2 + lambda * du^2
+        Includes Potential Well Braking for obstacles.
+        """
+        # 1. System Identification (First-order Inertia)
+        mass = max(100.0, self.physics.mass_total)
+        B = (200.0 / mass) * dt
+
+        # 2. Refined Target Calculation (Potential Well)
+        v_ref_final = v_limit_ref
+        target_id = self.next_node_id if self.next_node_id else (self.path_queue[0] if self.path_queue else None)
+
+        if target_id:
+            dist = self._dist_to(target_id)
+
+            # 障碍物距离
+            obs_dist = float('inf')
+            if self.rail_obstacles:
+                obs_dist, _ = min(self.rail_obstacles, key=lambda x: x[0])
+
+            # 道岔状态
+            switch_ready = True
+            if dist < 40.0 and not self._check_switch_status():
+                switch_ready = False
+
+            # 速度规划融合
+            if not switch_ready:
+                # 道岔未好，目标设为路口前 5m 停车
+                v_ref_final = self._calc_smooth_approach_v(dist - 5.0, v_limit_ref)
+            elif obs_dist < 60.0:
+                # 前车避让
+                v_ref_final = self._calc_smooth_approach_v(obs_dist - 20.0, v_limit_ref)
+            elif dist < 20.0:
+                # 进站自然减速
+                v_ref_final = self._calc_smooth_approach_v(dist, v_limit_ref)
+
+            # 终点吸附
+            if dist < 1.0:
+                self.current_node_id = target_id
+                self.next_node_id = None
+                self.switch_triggered = False
+                if self.path_queue and self.path_queue[0] == target_id:
+                    self.path_queue.popleft()
+                v_ref_final = 0.0
+
+        # 3. Optimization (Analytical)
+        lam = 0.1  # Smoothing factor
+        u_opt = (B * (v_ref_final - self.current_speed) + lam * self.mpc_prev_u) / (B ** 2 + lam)
+
+        # 4. Saturation
+        u_opt = np.clip(u_opt, -48.0, 48.0)
+        self.mpc_prev_u = u_opt
+        return u_opt
+
+    def _calc_smooth_approach_v(self, dist, v_max):
+        """Physics-based braking curve: v = sqrt(2*a*d)."""
+        if dist <= 0: return 0.0
+
+        # 估算当前环境下的最大可用减速度
+        mud = self.env.get('mud_factor', 0.5)
+        mu_est = 0.4 * (1.0 - 0.5 * mud)
+        a_brake = mu_est * 9.81 * 0.8  # 留 20% 安全余量
+
+        v_brake = math.sqrt(2 * a_brake * dist)
+        return min(v_max, v_brake)
+
+    def _handle_switch_control(self, now):
+        """[Interlocking] Active Switch Triggering based on Vector."""
+        target_id = self.next_node_id
+        dist = self._dist_to(target_id)
+        TRIGGER_DIST = 50.0
+
+        if dist < TRIGGER_DIST and not self.switch_triggered:
+            infra = self.infra.get(target_id)
+            if infra:
+                # 计算入站矢量，决定道岔方向
+                curr_p = self.map.nodes[self.current_node_id].pos
+                next_p = self.map.nodes[target_id].pos
+                vec_in = np.array(next_p) - np.array(curr_p)
+
+                # 网格逻辑：水平直行(NORMAL)，垂直转弯(REVERSE)
+                req_state = "NORMAL"
+                if abs(vec_in[1]) > abs(vec_in[0]):
+                    req_state = "REVERSE"
+
+                # 发送硬件指令
+                infra.handle_hardware_signal({
+                    'vid': self.id,
+                    'type': 'SWITCH_REQ',
+                    'target_state': req_state
+                })
+                self.switch_triggered = True
+
+        if dist > TRIGGER_DIST + 10.0:
+            self.switch_triggered = False
+
+    def _check_switch_status(self):
+        """Verify if switch is locked in position."""
+        infra = self.infra.get(self.next_node_id)
+        if not infra: return True
+        state = infra.get_broadcast_state()
+        # 只要不在移动或解锁中，即视为安全锁定
+        return state['state'] not in ["MOVING", "UNLOCKING"]
+
+    def _get_speed_limit(self):
+        """[EAVP] Environment-Adaptive Velocity Profiling."""
+        base_v = 300.0 / self.length
+
+        # 环境衰减
+        mud = self.env.get('mud_factor', 0.5)
+        env_factor = 1.0 / (1.0 + 1.5 * mud)
+        uncert_factor = 1.0 / (1.0 + 0.2 * self.network_uncertainty)
+
+        v_physics = base_v * env_factor * uncert_factor
+
+        # 模式约束
+        if self.state == VehicleState.SEARCHING:
+            return v_physics * 0.5
+
+        if self.mode == ControlMode.ROBUST:
+            return v_physics * 0.8
+        elif self.mode == ControlMode.HARDWARE_V2X:
+            return v_physics * 0.7
+        elif self.mode == ControlMode.EMERGENCY:
+            return v_physics * 0.1
+
+        return v_physics
+
+    # =========================================================================
+    # [Module 5] Support Functions
+    # =========================================================================
+
+    def _assess_network_condition(self, now):
+        if "Start" in str(self.current_node_id):
+            aoi = 0.0
         else:
-            self.path_queue = deque(["N_2_0", "N_2_1", "Stop_H_2_1"])
+            curr_infra = self.infra.get(self.current_node_id)
+            aoi = 0.1 if curr_infra else 15.0  # Large AoI if no infra
+
+        self.network_uncertainty = 0.5 + 0.2 * aoi
+
+        # Mode Switching Logic
+        if aoi < 1.0:
+            self.mode = ControlMode.PERFORMANCE
+        elif aoi < 10.0:
+            self.mode = ControlMode.ROBUST
+        else:
+            self.mode = ControlMode.HARDWARE_V2X
+
+    def _update_mission_logic(self, dt):
+        """
+        [Mission Loop]
+        Revised Logic: IDLE(Home) -> LOADING(Home) -> SEARCHING(To Target) -> UNLOADING(Target) -> RETURNING(Home)
+        Includes dynamic loading times based on wagon count.
+        """
+        # 获取车厢数量 (如果 Physics 中未定义，默认 1)
+        wagons = getattr(self.physics, 'num_wagons', 1)
+        # 动态装卸时间：基础 3秒 + 每车厢 2秒
+        op_time = 3.0 + wagons * 2.0
+
+        if self.state == VehicleState.IDLE:
+            self.wait_timer -= dt
+            if self.wait_timer <= 0:
+                # 休息结束，开始装货 (Loading at Home)
+                self.state = VehicleState.LOADING
+                self.wait_timer = op_time
+                logger.info(f"[{self.id}] State: IDLE -> LOADING (Duration: {op_time:.1f}s)")
+
+        elif self.state == VehicleState.LOADING:
+            self.wait_timer -= dt
+            if self.wait_timer <= 0:
+                # 装货完成，出发送货 (Search/Deliver)
+                self.state = VehicleState.SEARCHING
+                # 确保有目标
+                if not self.target_node or self.target_node == self.home_node:
+                    self.target_node = self._hash_food_target()
+
+                # 触发寻路
+                if self.mode == ControlMode.PERFORMANCE:
+                    self._plan_spacetime_optimal(0)
+                else:
+                    self._plan_local_path_static()
+
+                logger.info(f"[{self.id}] State: LOADING -> SEARCHING (Target: {self.target_node})")
+
+        elif self.state == VehicleState.SEARCHING:
+            if self.current_node_id == self.target_node:
+                # 到达终点，开始卸货
+                self.state = VehicleState.UNLOADING
+                self.wait_timer = op_time
+                logger.info(f"[{self.id}] State: SEARCHING -> UNLOADING")
+
+        elif self.state == VehicleState.UNLOADING:
+            self.wait_timer -= dt
+            if self.wait_timer <= 0:
+                # 卸货完成，返程回家
+                self.state = VehicleState.RETURNING
+                self.target_node = self.home_node
+                self.next_node_id = None
+                self.path_queue.clear()
+
+                if self.mode == ControlMode.PERFORMANCE:
+                    self._plan_spacetime_optimal(0)
+                else:
+                    self._plan_local_path_static()
+
+                logger.info(f"[{self.id}] State: UNLOADING -> RETURNING (Home: {self.home_node})")
+
+        elif self.state == VehicleState.RETURNING:
+            if self.current_node_id == self.target_node:
+                # 到家，休息
+                self.state = VehicleState.IDLE
+                self.wait_timer = 5.0  # Rest time
+                # 计算下一轮的目标
+                self.target_node = self._hash_food_target()
+                logger.info(f"[{self.id}] State: RETURNING -> IDLE")
+
+    def _sync_kinematics(self, dt):
+        tid = self.next_node_id if self.next_node_id else (self.path_queue[0] if self.path_queue else None)
+        if tid:
+            # [修复] 强制指定 dtype=float，防止读取整数坐标导致 self.pos_2d 变成 int 类型
+            t_pos = np.array(self.map.nodes[tid].pos, dtype=float)
+
+            vec = t_pos - self.pos_2d
+            dist = np.linalg.norm(vec)
+            if dist > 1e-4:
+                step = self.current_speed * dt
+                # 防止超调
+                if step > dist:
+                    self.pos_2d = t_pos
+                else:
+                    self.pos_2d += (vec / dist) * step
+
+    def _update_kinematics_3d(self, dt):
+        self.pos_3d[:2] = self.pos_2d
+        if hasattr(self.map, 'get_terrain_height'):
+            self.pos_3d[2] = self.map.get_terrain_height(self.pos_3d[0], self.pos_3d[1])
+
+    def _try_broadcast_semantic(self, now):
+        # 简单的事件触发广播
+        err = np.linalg.norm(self.pos_2d - self.last_broadcast_pos[:2])
+        if err > 1.0 or (now - self.last_broadcast_ts) > 5.0:
+            curr_infra = self.infra.get(self.current_node_id)
+            if curr_infra:
+                # [Fix] Added 'eta' and 'duration' to payload to prevent KeyError in Infrastructure
+                packet = {
+                    'vid': self.id,
+                    'pos': self.pos_2d,
+                    'vel': self.current_speed,
+                    'timestamp': now,
+                    'pos_uncertainty': self.network_uncertainty,
+                    'eta': now,
+                    'duration': 2.0,
+                    'direction': 'NORMAL'
+                }
+                curr_infra.handle_semantic_packet(packet)
+            self.last_broadcast_pos = self.pos_3d.copy()
+            self.last_broadcast_ts = now
+            self.energy.comm_joules += 0.01
+
+    def _hash_food_target(self):
+        h = hash(self.id)
+        rows, cols = self.map.rows, self.map.cols
+        return f"N_{h % rows}_{(cols // 2) + (h % (cols // 2))}"
 
     def _dist_to(self, node_id):
         if node_id not in self.map.nodes: return 0.0
-        target_pos = np.array(self.map.nodes[node_id].pos)
-        return np.linalg.norm(self.pos_2d - target_pos)
+        return np.linalg.norm(self.pos_2d - np.array(self.map.nodes[node_id].pos))
 
-    def _update_kinematics(self, dist_step):
-        """
-        [Fix] 严格沿着路径向量移动，解决漂移问题
-        """
-        if not self.path_queue: return
-        target_id = self.path_queue[0]
-        if target_id not in self.map.nodes: return
+    # 占位函数 (兼容性)
+    def _resolve_next_hop_gradient(self):
+        pass
 
-        target_pos = np.array(self.map.nodes[target_id].pos)
-        vec = target_pos - self.pos_2d
-
-        dist_remain = np.linalg.norm(vec)
-        if dist_remain > 1e-4:
-            direction = vec / dist_remain
-
-            # 防止过冲 (Overshoot)
-            # 只有向前走(dist_step > 0)且步长大于剩余距离时才直接吸附
-            if dist_step > 0 and dist_step > dist_remain:
-                self.pos_2d = target_pos
-            else:
-                self.pos_2d += direction * dist_step
+    def _resolve_next_hop_distributed(self):
+        pass

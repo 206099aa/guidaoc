@@ -83,11 +83,14 @@ class HeadlessRunner:
 
 
 if __name__ == "__main__":
-    # SCI 敏感性分析计划
-    # 扫描不同的泥泞度，证明算法鲁棒性
+    # [SCI 核心配置] 定义扫描计划
+    # 1. 泥泞度：从 0.1 到 0.9，每隔 0.1 测一次 -> 生成 Actuator Load 横向分布图
+    # 2. 车辆类型：覆盖重载车和侦察车 -> 生成 Pareto 异构对比
     sweep_plan = {
-        'environment.mud_factor': [0.1, 0.5, 0.9],
-        # 'algorithms.controller': ['SMC']
+        'environment.mud_factor': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        # 如果你想跑得快一点，可以注释掉下面这行（只跑默认车辆）
+        # 但为了 Pareto 图好看，建议保留
+        'vehicle_types.Heavy_Hauler.pid.kp': [2000]
     }
 
     if not os.path.exists("config.yaml"):
@@ -96,11 +99,12 @@ if __name__ == "__main__":
 
     all_results = []
     print("Starting Batch Simulation for SCI Analysis...")
-    print("(This may take a minute, please wait...)")
+    print("(This process simulates multiple episodes, please wait...)")
 
     # 生成配置矩阵
     configs = list(ConfigLoader.generate_sweep("config.yaml", sweep_plan))
 
+    # 使用 tqdm 显示进度条
     for cfg in tqdm(configs):
         runner = HeadlessRunner(cfg)
         df = runner.run_episode()
@@ -109,7 +113,8 @@ if __name__ == "__main__":
     # 合并并保存
     if all_results:
         final_df = pd.concat(all_results)
+        # 保存为 analysis-optimized.py 能识别的文件名格式
         final_df.to_csv("data/batch_results_sci.csv", index=False)
-        print("Batch Simulation Complete. Data saved to data/batch_results_sci.csv")
+        print(f"Batch Simulation Complete. Generated {len(final_df)} data points.")
     else:
         print("No results generated.")
